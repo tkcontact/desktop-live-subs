@@ -25,7 +25,7 @@ from overlay import Overlay
 from sentences import FragmentMerger, RecentFilter, Unit, VoiceRef, pick_ref
 from settings import ROOT, Settings
 from tray import ASR_LABELS, Tray
-from translator import MAX_BATCH_CHARS, Profile, StrataUnavailable, Translator, list_profiles
+from translator import _JAPANESE, MAX_BATCH_CHARS, Profile, StrataUnavailable, Translator, list_profiles
 
 LOG_DIR = ROOT / "logs"
 PROFILE_DIR = ROOT / "profiles"
@@ -118,6 +118,39 @@ class WhisperSource:
             units += self.merger.flush_due(time.perf_counter(), self.speaking)
             for u in units:
                 self.app.submit(u)
+
+
+class SpeechStream:
+    """訳している途中の文を、文末まで確定したところから読み上げに回す (訳し終わるのを待たずに読み始める)"""
+
+    def __init__(self, speaker, unit: Unit):
+        self.speaker = speaker
+        self.unit = unit
+        self.job = None
+        self.sent = ""  # 読み上げに回した部分
+
+    def update(self, text: str) -> None:
+        from tts import confirmed_prefix
+
+        self._send(text[: confirmed_prefix(text)])
+
+    def finish(self, text: str | None) -> None:
+        """訳し終えた (text が None なら失敗した)。残りを回して終える"""
+        if text:
+            self._send(text)
+        if self.job:
+            self.job.end()
+
+    def _send(self, prefix: str) -> None:
+        # 訳し直しなどで食い違ったら、もう読んだ分はそのままにして続けない
+        if not prefix.startswith(self.sent) or not _JAPANESE.search(prefix[len(self.sent):]):
+            return
+        if self.job is None:
+            self.job = self.speaker.begin(self.unit.ref, self.unit.ended_at)
+            if self.job is None:
+                return
+        self.job.add(prefix[len(self.sent):])
+        self.sent = prefix
 
 
 class App:
@@ -444,10 +477,19 @@ class App:
                 self.overlay.show(unit.text, "…", new=True)
                 t0 = time.perf_counter()
                 while True:
+                    speech = SpeechStream(self.speaker, unit) if self.speaker else None
+
+                    def on_partial(s, u=unit, speech=speech):
+                        self.overlay.show(u.text, s)
+                        if speech:
+                            speech.update(s)
+
                     try:
-                        ja, ttft = self.translator.translate(unit.text, lambda s, u=unit: self.overlay.show(u.text, s))
+                        ja, ttft = self.translator.translate(unit.text, on_partial)
                         break
                     except StrataUnavailable as e:
+                        if speech:
+                            speech.finish(None)
                         if not strata_down:
                             log.warning("Strata に接続できません: %s", e)
                             strata_down = True
@@ -461,6 +503,8 @@ class App:
                         log.exception("翻訳に失敗しました")
                         ja, ttft = f"[翻訳エラー] {e}", 0.0
                         break
+                if speech:
+                    speech.finish(ja if unit and not ja.startswith("[翻訳エラー]") else None)
                 if unit is None:
                     continue
                 if strata_down:
@@ -470,8 +514,6 @@ class App:
 
                 done = time.perf_counter()
                 self.overlay.show(unit.text, ja)
-                if self.speaker and ja and not ja.startswith("[翻訳エラー]"):
-                    self.speaker.say(ja, unit.ref, unit.ended_at)
                 backlog = self.units.qsize()
                 mode = self.source.name if self.source else "-"
                 log.info(

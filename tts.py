@@ -21,7 +21,7 @@ import threading
 import time
 import types
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
 
@@ -102,6 +102,20 @@ class _NativePicker:
             elif self.current == "female" and hz < 140:
                 self.current = "male"
         return self.current or "male", (2**self.level if self.level is not None else None)
+
+
+def confirmed_prefix(text: str) -> int:
+    """訳している途中の文のうち、文末まで確定した部分の長さ (句点などの後に続きが来たところまで。
+    かぎかっこの中では区切らない)。split_pieces と同じ区切り方"""
+    end, depth = 0, 0
+    for i, ch in enumerate(text):
+        if ch in "「『（(":
+            depth += 1
+        elif ch in "」』）)":
+            depth = max(0, depth - 1)
+        elif ch in "。！？!?" and depth == 0 and i + 1 < len(text) and text[i + 1] not in "。！？!?…」』）)":
+            end = i + 1
+    return end
 
 
 def _max_tokens(text: str) -> int:
@@ -508,10 +522,20 @@ class _Player:
 
 
 @dataclass
-class _Job:
-    text: str
-    ref: VoiceRef
+class SpeechJob:
+    """1 つの訳文の読み上げ。訳しながら確定した文が add で届くので、end までを順に読む"""
+
+    ref: VoiceRef | None
     ended_at: float  # 元の発話が終わった時刻 (perf_counter)
+    text: str = ""
+    pieces: queue.Queue = field(default_factory=queue.Queue)
+
+    def add(self, text: str) -> None:
+        self.text += text
+        self.pieces.put(text)
+
+    def end(self) -> None:
+        self.pieces.put(None)
 
 
 class Speaker:
@@ -521,7 +545,7 @@ class Speaker:
         self.settings = settings
         self.on_error = on_error
         self.worker = TTSWorker(settings["tts_model"])
-        self.jobs: deque[_Job] = deque()
+        self.jobs: deque[SpeechJob] = deque()
         self._cv = threading.Condition()
         self._stopped = False
         self._last_ref: VoiceRef | None = None
@@ -552,16 +576,25 @@ class Speaker:
         self.worker.stop()
 
     def say(self, text: str, ref: VoiceRef | None, ended_at: float) -> None:
+        job = self.begin(ref, ended_at)
+        if job:
+            job.add(text)
+            job.end()
+
+    def begin(self, ref: VoiceRef | None, ended_at: float) -> SpeechJob | None:
+        """訳文の読み上げを始める。文は返した SpeechJob に add し、最後に end する。読めないときは None"""
         if ref is None or ref.seconds < MIN_REF_SEC:
             ref = self._last_ref or ref  # 短すぎる見本 (「Yeah.」だけなど) より、直前の話し手の声を使う
         else:
             self._last_ref = ref
         if ref is None and self.settings["tts_voice"] != "native":
-            log.debug("声の見本がないので読み上げません: %s", text)
-            return
+            log.debug("声の見本がないので読み上げません")
+            return None
+        job = SpeechJob(ref, ended_at)
         with self._cv:
-            self.jobs.append(_Job(text, ref, ended_at))
+            self.jobs.append(job)
             self._cv.notify()
+        return job
 
     def _run(self) -> None:
         from audiotsm import wsola
@@ -584,9 +617,23 @@ class Speaker:
             # さらに速く読んで追いつく。翻訳を待つ分の遅れ (3 秒前後) はいつもあるので数えない
             speed = min(s["tts_max_speed"], s["tts_speed"] + 0.15 * max(0.0, wait - 0.5) + 0.1 * backlog)
             tsm = wsola(1, speed=speed) if speed > 1.02 else None
+            st = {"first_sec": 0.0, "gen_sec": 0.0, "audio_sec": 0.0, "voice": None}
             try:
-                for x in self.worker.synthesize(split_pieces(job.text), job.ref, s["tts_voice"], s["tts_native"]):
-                    self.player.feed(_stretch(tsm, x))
+                while True:
+                    try:
+                        text = job.pieces.get(timeout=30)
+                    except queue.Empty:
+                        log.warning("訳文の続きが届かないので読み上げを打ち切ります: %s", job.text)
+                        break
+                    if text is None:
+                        break
+                    for x in self.worker.synthesize(split_pieces(text), job.ref, s["tts_voice"], s["tts_native"]):
+                        self.player.feed(_stretch(tsm, x))
+                    last = self.worker.last
+                    st["first_sec"] = st["first_sec"] or last["first_sec"]
+                    st["gen_sec"] += last["gen_sec"]
+                    st["audio_sec"] += last["audio_sec"]
+                    st["voice"] = last.get("voice")
                 if tsm:
                     self.player.feed(_stretch(tsm, None))
             except (EOFError, OSError) as e:
@@ -597,7 +644,6 @@ class Speaker:
                 log.exception("読み上げに失敗しました: %s", job.text)
                 self.on_error(f"読み上げに失敗しました: {e}")
                 continue
-            st = self.worker.last
             log.info("読み上げ 生成%5.2fs(初音%4.2fs) 音声%4.1fs ×%.2f 遅れ%4.1fs 待ち%d 声 %s → %s | %s",
                      st["gen_sec"], st["first_sec"], st["audio_sec"], speed, lag, backlog, st.get("voice"),
                      self.player.device_name or "-", job.text)
