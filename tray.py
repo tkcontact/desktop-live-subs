@@ -68,6 +68,7 @@ class Tray:
             Item("音声の取得元 (Whisper)", Menu(*devices, Menu.SEPARATOR, Item("一覧を読み直す", lambda: self.refresh()))),
             Item("読み上げ", Menu(
                 Item("日本語で読み上げる (元の声をまねる)", lambda: app.toggle_tts(), checked=lambda _: s["tts"]),
+                Item("話し方までまねる (英語なまりになる)", lambda: app.toggle_icl(), checked=lambda _: s["tts_icl"]),
                 Item("読み上げ中は元の音を小さくする", lambda: app.toggle_duck(), checked=lambda _: s["tts_duck"]),
                 Menu.SEPARATOR,
                 Item("出力先", Menu(*outputs)),

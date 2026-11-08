@@ -1,7 +1,8 @@
 """訳した日本語を、元の話し手の声色・話し方をまねて読み上げる
 
 声のまね (ボイスクローン) は Qwen3-TTS を CUDA Graph で速くした faster-qwen3-tts。見本には、その文の英語の
-発話の音声と Whisper の文字起こしを使うので、話し手が変わっても声の高さやテンション、録り方の雰囲気がついてくる。
+発話の音声を使うので、話し手が変わっても声についてくる。既定では見本から声質 (話者の埋め込み) だけを取る。
+見本の音声と文字起こしの続きとして読ませる (ICL) と話し方や抑揚までまねるが、英語なまりの日本語になる。
 モデルは子プロセスで動かす (PyTorch は重く、生成中に録音や字幕ウィンドウのスレッドを待たせないように)。
 読み上げはこのプロセスから鳴らすので、プロセス単位のループバック録音には入らない。
 
@@ -103,10 +104,10 @@ class TTSWorker:
         self.info = msg[1]
         return self.info
 
-    def synthesize(self, texts: list[str], ref: VoiceRef):
+    def synthesize(self, texts: list[str], ref: VoiceRef, icl: bool = False):
         """texts を ref の声で順に読んだ音声 (24kHz float32) を少しずつ返す。終わると self.last に所要時間が入る。
-        途中でやめると子プロセスとのやりとりがずれるので、最後まで読み切ること。"""
-        self.conn.send(("say", texts, np.asarray(ref.audio, np.float32), ref.rate, ref.text))
+        icl なら見本の話し方までまねる。途中でやめると子プロセスとのやりとりがずれるので、最後まで読み切ること。"""
+        self.conn.send(("say", texts, np.asarray(ref.audio, np.float32), ref.rate, ref.text, icl))
         while True:
             msg = self.conn.recv()
             if msg[0] == "chunk":
@@ -170,14 +171,17 @@ def _worker(address: str, model_name: str) -> None:
             return
         if msg[0] == "quit":
             return
-        _, texts, audio, rate, ref_text = msg
+        _, texts, audio, rate, ref_text, icl = msg
         try:
             t0 = time.perf_counter()
             # 見本の音量をそろえる (読み上げ中は元の音を下げているので、その間に録った見本は小さい)
             rms = float(np.sqrt(np.mean(audio**2))) if len(audio) else 0.0
             audio = np.clip(audio * (0.08 / rms), -1.0, 1.0) if rms > 1e-4 else audio
-            ref = np.concatenate([audio, np.zeros(int(rate * REF_SILENCE_SEC), np.float32)])
-            prompt = model.model.create_voice_clone_prompt(ref_audio=(ref, rate), ref_text=ref_text)
+            if icl:
+                ref = np.concatenate([audio, np.zeros(int(rate * REF_SILENCE_SEC), np.float32)])
+                prompt = model.model.create_voice_clone_prompt(ref_audio=(ref, rate), ref_text=ref_text)
+            else:
+                prompt = model.model.create_voice_clone_prompt(ref_audio=(audio, rate), x_vector_only_mode=True)
             first, n = None, 0
             for text in texts:
                 for chunk, sr, _ in model.generate_voice_clone_streaming(
@@ -502,15 +506,17 @@ class Speaker:
                     return
                 job = self.jobs.popleft()
                 backlog = len(self.jobs)
-            lag = time.perf_counter() + self.player.queued_sec() - job.ended_at
+            wait = self.player.queued_sec()  # 前の読み上げが鳴り終わるまで
+            lag = time.perf_counter() + wait - job.ended_at
             if lag > s["tts_max_lag_sec"]:
                 log.info("読み上げが %.1f 秒遅れているので飛ばします: %s", lag, job.text)
                 continue
-            # 遅れが 3 秒を超えたり次が待っていたりしたら、少し速く読んで追いつく
-            speed = min(s["tts_max_speed"], 1.0 + max(0.0, lag - 3.0) * 0.08 + 0.1 * backlog)
+            # 前の読み上げがまだ鳴っていたり次が待っていたりする (詰まっている) ときだけ、少し速く読んで追いつく。
+            # 翻訳を待つ分の遅れ (3 秒前後) はいつもあるので数えない
+            speed = min(s["tts_max_speed"], 1.0 + 0.15 * max(0.0, wait - 0.5) + 0.1 * backlog)
             tsm = wsola(1, speed=speed) if speed > 1.02 else None
             try:
-                for x in self.worker.synthesize(split_pieces(job.text), job.ref):
+                for x in self.worker.synthesize(split_pieces(job.text), job.ref, s["tts_icl"]):
                     self.player.feed(_stretch(tsm, x))
                 if tsm:
                     self.player.feed(_stretch(tsm, None))

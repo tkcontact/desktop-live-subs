@@ -37,6 +37,8 @@ DEFAULTS = {
     # 読み上げ (訳文を元の話し手の声をまねて読む。Whisper 方式のみ)
     "tts": False,
     "tts_model": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    # True で見本の話し方・抑揚までまねる (ICL)。英語の発音のくせも移って、なまった日本語になる
+    "tts_icl": False,
     "tts_output": "auto",  # "auto" (元の音が鳴っているデバイス) | "default" | デバイス名
     "tts_duck": True,  # 読み上げている間、ほかのアプリの音を下げる
     "tts_duck_level": 0.3,  # 下げるときの倍率

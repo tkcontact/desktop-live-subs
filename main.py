@@ -328,6 +328,11 @@ class App:
         self.tray.refresh()
         threading.Thread(target=self._start_tts if self.settings["tts"] else self._stop_tts, daemon=True).start()
 
+    def toggle_icl(self) -> None:
+        self.settings["tts_icl"] = not self.settings["tts_icl"]
+        self.settings.save()
+        self.tray.refresh()
+
     def toggle_duck(self) -> None:
         self.settings["tts_duck"] = not self.settings["tts_duck"]
         self.settings.save()
