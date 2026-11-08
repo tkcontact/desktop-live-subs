@@ -1,12 +1,13 @@
-"""Whisper の VRAM 使用量を測り、Strata に空けておいてもらう量 (--vram-reserve-mib) を決める
+"""Whisper と読み上げの VRAM 使用量を測り、Strata に空けておいてもらう量 (--vram-reserve-mib) を決める
 
-    python vram.py --reserve   予約量 (MiB) を 1 行で出す。測ったことがなければ先に測る (start.cmd が使う)
-    python vram.py --measure   測り直して結果を出す
+    python vram.py --strata-args  Strata の起動に足す引数を 1 行で出す。測ったことがなければ先に測る (start.cmd が使う)
+    python vram.py --reserve      予約量 (MiB) だけを出す
+    python vram.py --measure      測り直して結果を出す
     python vram.py --stress 120 [--audio 音声ファイル]
                                Whisper と Strata を同時に回し続け、VRAM の最大使用量とエラーを出す
 
 Strata は起動時に空いている VRAM から予約量を引いた分をエキスパートのキャッシュに使う。
-start.cmd は Strata → 字幕ツールの順に起動するので、予約量には Whisper の分を含める。
+start.cmd は Strata → 字幕ツールの順に起動するので、予約量には Whisper (と読み上げ) の分を含める。
 """
 
 import argparse
@@ -22,7 +23,10 @@ from settings import ROOT, Settings
 RESULT = ROOT / "vram.json"
 # Strata が既定で画面表示用に空けておく量 (16GB 以下で画面をつないだカード)
 DESKTOP_RESERVE_MIB = 1536
+# 読み上げを使うときは画面表示の予備を減らす (Whisper と Strata を 2 分回し続けても、予備のうち使ったのは 300MiB ほど)
+TTS_DESKTOP_RESERVE_MIB = 768
 MARGIN_MIB = 256
+TTS_ESTIMATE_MIB = 3000  # 読み上げのモデルを測るまでの見積もり (0.6B で実測 2935MiB)
 
 
 def gpu_used_mib(index: int = 0) -> int:
@@ -31,6 +35,16 @@ def gpu_used_mib(index: int = 0) -> int:
     pynvml.nvmlInit()
     try:
         return pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(index)).used // 2**20
+    finally:
+        pynvml.nvmlShutdown()
+
+
+def gpu_free_mib(index: int = 0) -> int:
+    import pynvml
+
+    pynvml.nvmlInit()
+    try:
+        return pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(index)).free // 2**20
     finally:
         pynvml.nvmlShutdown()
 
@@ -93,6 +107,31 @@ def measure(settings: Settings) -> dict:
         "compute_type": settings["compute_type"],
         "beam_size": settings["beam_size"],
         "measured_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def measure_tts(settings: Settings) -> dict:
+    """読み上げのモデルを (子プロセスで) 読み込んで 1 文読ませ、その間に増えた VRAM の最大値を測る"""
+    from sentences import VoiceRef
+    from tts import TTSWorker
+
+    before = gpu_used_mib()
+    worker = TTSWorker(settings["tts_model"])
+    with PeakSampler() as sampler:
+        info = worker.start()
+        rng = np.random.default_rng(0)
+        ref = VoiceRef((rng.standard_normal(24000 * 4) * 0.05).astype(np.float32), 24000, "Hello there, this is just a test.")
+        t = time.perf_counter()
+        samples = sum(len(x) for x in worker.synthesize(["こんにちは、これは読み上げの確認です。"], ref))
+        gen_sec = time.perf_counter() - t
+    worker.stop()
+    return {
+        "tts_mib": sampler.peak - before,
+        "tts_model": settings["tts_model"],
+        "tts_load_sec": info.get("load_sec"),
+        "tts_gen_sec": round(gen_sec, 2),
+        "tts_audio_sec": round(samples / 24000, 2),
+        "tts_measured_at": datetime.now().isoformat(timespec="seconds"),
     }
 
 
@@ -192,16 +231,51 @@ def load_result(settings: Settings) -> dict | None:
 
 
 def save_result(result: dict) -> None:
-    RESULT.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    """測った結果を vram.json に書き足す (Whisper と読み上げは別々に測ることがある)"""
+    try:
+        saved = json.loads(RESULT.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    RESULT.write_text(json.dumps({**saved, **result}, indent=2), encoding="utf-8")
 
 
-def reserve_mib(settings: Settings, result: dict) -> int:
-    return DESKTOP_RESERVE_MIB + result["whisper_mib"] + MARGIN_MIB + int(settings["strata_extra_reserve_mib"])
+def tts_mib(settings: Settings) -> int:
+    """読み上げのモデルの VRAM 使用量。測ったことがなければ見積もり"""
+    try:
+        r = json.loads(RESULT.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        r = {}
+    return r["tts_mib"] if r.get("tts_model") == settings["tts_model"] and "tts_mib" in r else TTS_ESTIMATE_MIB
+
+
+def reserve_mib(settings: Settings, result: dict, loaded: bool = False) -> int:
+    """Strata に空けておいてもらう量。loaded なら Whisper はもう読み込んである (使用中の分は空きに入らない)"""
+    whisper = result["whisper_mib"] - (result.get("idle_after_mib", 0) if loaded else 0)
+    if settings["tts"]:
+        desktop, tts = TTS_DESKTOP_RESERVE_MIB, tts_mib(settings)
+    else:
+        desktop, tts = DESKTOP_RESERVE_MIB, 0
+    return desktop + whisper + tts + MARGIN_MIB + int(settings["strata_extra_reserve_mib"])
+
+
+def strata_args(settings: Settings, loaded: bool = False) -> list[str]:
+    """Strata の起動に足す引数 (VRAM の予約量など)"""
+    result = load_result(settings)
+    if result is None:
+        result = measure(settings)
+        save_result(result)
+    args = ["--set", f"vram-reserve-mib={reserve_mib(settings, result, loaded)}"]
+    if settings["tts"]:
+        # 先読みの下書き役 (DFlash2) を外して 0.7GB ほど空ける。録った 61 文を訳し直した中央値は
+        # 外さない 1.53 秒 (キャッシュ 2272 枠) → 外してキャッシュ 483 枠でも 1.68 秒で、ほとんど変わらない
+        args += ["--drafting", "off"]
+    return args
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--strata-args", action="store_true")
     g.add_argument("--reserve", action="store_true")
     g.add_argument("--measure", action="store_true")
     g.add_argument("--stress", type=float, metavar="秒", help="Whisper と Strata を同時に回し続けて VRAM を調べる")
@@ -215,10 +289,15 @@ def main() -> None:
     if result is None:
         result = measure(settings)
         save_result(result)
-    if args.reserve:
+    if settings["tts"] and (args.measure or result.get("tts_model") != settings["tts_model"]):
+        result.update(measure_tts(settings))
+        save_result(result)
+    if args.strata_args:
+        print(" ".join(strata_args(settings)))
+    elif args.reserve:
         print(reserve_mib(settings, result))
     else:
-        print(json.dumps({**result, "strata_reserve_mib": reserve_mib(settings, result)}, indent=2))
+        print(json.dumps({**result, "strata_args": " ".join(strata_args(settings))}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

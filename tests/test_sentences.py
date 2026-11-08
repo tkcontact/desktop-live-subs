@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sentences import CaptionTracker, FragmentMerger, RecentFilter, Unit  # noqa: E402
+from sentences import CaptionTracker, FragmentMerger, RecentFilter, Unit, VoiceRef, pick_ref  # noqa: E402
 
 
 class CaptionTrackerTest(unittest.TestCase):
@@ -142,6 +142,24 @@ class FragmentMergerTest(unittest.TestCase):
         m = FragmentMerger()
         text = " ".join(["word"] * 30)
         self.assertEqual([u.text for u in m.add(Unit(text, 0, cut=True), 0)], [text])
+
+
+class PickRefTest(unittest.TestCase):
+    def ref(self, sec):
+        return VoiceRef([0.0] * int(sec * 10), 10, f"{sec}s")
+
+    def test_newer_unless_too_short(self):
+        self.assertEqual(pick_ref(self.ref(3), self.ref(2.5)).text, "2.5s")
+        self.assertEqual(pick_ref(self.ref(3), self.ref(1)).text, "3s")
+        self.assertEqual(pick_ref(self.ref(0.5), self.ref(1)).text, "1s")
+        self.assertEqual(pick_ref(None, self.ref(1)).text, "1s")
+        self.assertEqual(pick_ref(self.ref(1), None).text, "1s")
+
+    def test_merger_keeps_ref(self):
+        m = FragmentMerger()
+        m.add(Unit("Yeah.", 0, ref=self.ref(3)), 0)
+        out = m.add(Unit("I think that's right.", 1, ref=self.ref(1)), 1)
+        self.assertEqual(out[0].ref.text, "3s")
 
 
 class RecentFilterTest(unittest.TestCase):

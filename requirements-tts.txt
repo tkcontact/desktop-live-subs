@@ -1,0 +1,7 @@
+# 読み上げ (tts.py) を使うときだけ。setup.cmd が先に CUDA 版の PyTorch を入れる
+# Qwen3-TTS を CUDA Graph で速くしたもの (素の qwen-tts は RTX 4070 で実時間の 0.5 倍の速さしか出ない)
+faster-qwen3-tts==0.5.4
+# 5.22 では Qwen3-TTS のトークナイザーが読み込めない (Qwen3TTSTokenizerV2Encoder の upsample)
+transformers==5.15.1
+# 遅れたときに速く読む (WSOLA)
+audiotsm

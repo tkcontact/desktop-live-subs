@@ -4,9 +4,9 @@ nvidia-cublas-cu12
 openai
 # WASAPI ループバック録音 (PyAudio のフォーク)
 PyAudioWPatch
-# 出力デバイスのサンプルレートから 16kHz への変換
+# 出力デバイスのサンプルレートから 24kHz / 16kHz への変換
 soxr
-# 既定の出力デバイスが切り替わったかの確認
+# 出力デバイスの一覧、プロセス単位のループバック、読み上げ中にほかのアプリの音量を下げる
 pycaw
 # ライブキャプションの字幕テキストを UI Automation で読む
 uiautomation

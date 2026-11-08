@@ -1,13 +1,18 @@
-"""出力デバイスの音声を WASAPI ループバックで取り、VAD で発話ごとに切り出す"""
+"""出力デバイスの音声を WASAPI ループバックで取り、VAD で発話ごとに切り出す
+
+録る音声は 24kHz (読み上げで声をまねる見本にも使う)。VAD と Whisper には 16kHz にして渡す。
+"""
 
 import logging
 import threading
 import time
+from collections import deque
 
 import numpy as np
 from faster_whisper.vad import VadOptions, get_speech_timestamps
 
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 16000  # VAD と Whisper
+CAPTURE_RATE = 24000  # 録音 (読み上げの声の見本)
 log = logging.getLogger(__name__)
 
 
@@ -53,7 +58,7 @@ def _device_signature(target: str):
 
 
 class _Stream:
-    """1 つの出力デバイスのループバック。届いた音を 16kHz mono にして溜める。"""
+    """1 つの出力デバイスのループバック。届いた音を 24kHz mono にして溜める。"""
 
     def __init__(self, pa, dev: dict, block_sec: float):
         import pyaudiowpatch as pyaudio
@@ -61,7 +66,7 @@ class _Stream:
 
         self.name = dev["name"].removesuffix(" [Loopback]")
         rate, channels = int(dev["defaultSampleRate"]), dev["maxInputChannels"]
-        resampler = soxr.ResampleStream(rate, SAMPLE_RATE, 1, dtype="float32")
+        resampler = soxr.ResampleStream(rate, CAPTURE_RATE, 1, dtype="float32")
         self.lock = threading.Lock()
         self.pending: list[np.ndarray] = []
 
@@ -97,7 +102,7 @@ class _Stream:
 
 
 class LoopbackAudio:
-    """出力デバイスに流れている音を WASAPI ループバックで取り、16kHz mono の float32 で読む。
+    """出力デバイスに流れている音を WASAPI ループバックで取り、24kHz mono の float32 で読む。
 
     target が "all" ならすべての出力デバイスの音を足し合わせる (アプリごとに出力先を変えていても拾える)。
     "default" なら既定の出力デバイスだけ、それ以外はその名前のデバイスだけ。
@@ -172,7 +177,7 @@ class LoopbackAudio:
             if gap < self.block_sec * 2:
                 return np.zeros(0, np.float32)
             self._last_data = now
-            return np.zeros(int(SAMPLE_RATE * gap), np.float32)
+            return np.zeros(int(CAPTURE_RATE * gap), np.float32)
         self._last_data = now
         if len(chunks) == 1:
             return chunks[0]
@@ -198,7 +203,7 @@ class FileAudio:
 
         self.proc = subprocess.Popen(
             [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-re", "-i", self.path,
-             "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "pipe:1"],
+             "-vn", "-ac", "1", "-ar", str(CAPTURE_RATE), "-f", "s16le", "pipe:1"],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
@@ -207,7 +212,7 @@ class FileAudio:
             self.proc.kill()
 
     def read(self) -> np.ndarray:
-        n = int(SAMPLE_RATE * self.block_sec)
+        n = int(CAPTURE_RATE * self.block_sec)
         data = self.proc.stdout.read(n * 2)
         if not data:  # 終わったら無音を流し続ける
             time.sleep(self.block_sec)
@@ -229,19 +234,23 @@ class Segmenter:
             speech_pad_ms=200,
         )
         self.buf = np.zeros(0, np.float32)
+        self.start = 0  # buf の先頭が、受け取り始めてから何サンプル目か
         self.speaking = False  # バッファの末尾で発話が続いているか
 
-    def reset(self) -> None:
+    def reset(self, skipped: int = 0) -> None:
+        """溜めた分 (と、渡さずに飛ばした skipped サンプル) を捨てる"""
+        self.start += len(self.buf) + skipped
         self.buf = np.zeros(0, np.float32)
         self.speaking = False
 
-    def feed(self, samples: np.ndarray, now: float) -> list[tuple[np.ndarray, float]]:
-        """(発話の音声, 発話が終わった時刻) のリストを返す。now は samples の末尾を受け取った時刻 (perf_counter)。"""
+    def feed(self, samples: np.ndarray, now: float) -> list[tuple[np.ndarray, float, int]]:
+        """(発話の音声, 発話が終わった時刻, 発話の先頭が何サンプル目か) のリストを返す。
+        now は samples の末尾を受け取った時刻 (perf_counter)。"""
         self.buf = np.concatenate([self.buf, samples])
         speeches = get_speech_timestamps(self.buf, self.vad)
         if not speeches:
             # 発話なし: 喋り出しを取りこぼさないよう直近 1 秒だけ残す
-            self.buf = self.buf[-SAMPLE_RATE:]
+            self._drop(max(0, len(self.buf) - SAMPLE_RATE))
             self.speaking = False
             return []
 
@@ -249,22 +258,48 @@ class Segmenter:
         ongoing = speeches.pop() if speeches[-1]["end"] >= len(self.buf) else None
         self.speaking = ongoing is not None
         n = len(self.buf)
-        chunks = [(self.buf[s["start"] : s["end"]], now - (n - s["end"]) / SAMPLE_RATE) for s in speeches]
-        if ongoing:
-            self.buf = self.buf[ongoing["start"] :]
-        else:
-            self.buf = self.buf[speeches[-1]["end"] :]
+        chunks = [(self.buf[s["start"] : s["end"]], now - (n - s["end"]) / SAMPLE_RATE, self.start + s["start"])
+                  for s in speeches]
+        self._drop(ongoing["start"] if ongoing else speeches[-1]["end"])
         return chunks
+
+    def _drop(self, n: int) -> None:
+        self.buf = self.buf[n:]
+        self.start += n
+
+
+class _Ring:
+    """直近 max_sec 秒の 24kHz の音声。受け取り始めてからのサンプル番号で切り出す。"""
+
+    def __init__(self, max_sec: float = 30.0):
+        self.max = int(CAPTURE_RATE * max_sec)
+        self.blocks: deque[tuple[int, np.ndarray]] = deque()
+        self.total = 0
+
+    def append(self, x: np.ndarray) -> None:
+        self.blocks.append((self.total, x))
+        self.total += len(x)
+        while self.blocks and self.blocks[0][0] + len(self.blocks[0][1]) < self.total - self.max:
+            self.blocks.popleft()
+
+    def slice(self, a: int, b: int) -> np.ndarray:
+        parts = [x[max(0, a - s) : max(0, b - s)] for s, x in self.blocks if s < b and s + len(x) > a]
+        return np.concatenate(parts) if parts else np.zeros(0, np.float32)
 
 
 class Capture:
-    """LoopbackAudio (または FileAudio) を別スレッドで読み続け、切り出した発話を on_chunk に渡す。"""
+    """LoopbackAudio (または FileAudio) を別スレッドで読み続け、切り出した発話を on_chunk に渡す。
+
+    on_chunk(16kHz の発話, 発話が終わった時刻, 同じ発話の 24kHz の音声)
+    """
 
     def __init__(self, on_chunk, audio, min_silence_ms: int = 500, max_speech_s: float = 8.0):
         self.on_chunk = on_chunk
         self.segmenter = Segmenter(min_silence_ms, max_speech_s)
+        self.ring = _Ring()
         self.audio = audio
         self.paused = threading.Event()
+        self.muted = None  # True を返す間は録った音を捨てる (読み上げの音が入る取得元で、読み上げている間)
         self._stop = threading.Event()
         self._thread = None
 
@@ -285,6 +320,10 @@ class Capture:
         self.audio.stop()
 
     def _run(self) -> None:
+        import soxr
+
+        to16k = soxr.ResampleStream(CAPTURE_RATE, SAMPLE_RATE, 1, dtype="float32")
+        ratio = CAPTURE_RATE / SAMPLE_RATE
         while not self._stop.is_set():
             try:
                 samples = self.audio.read()
@@ -297,10 +336,13 @@ class Capture:
                 except Exception:
                     log.exception("音声デバイスを開けませんでした")
                 continue
-            if self.paused.is_set():
-                self.segmenter.reset()
-                continue
             if not len(samples):
                 continue
-            for chunk, ended_at in self.segmenter.feed(samples, time.perf_counter()):
-                self.on_chunk(chunk, ended_at)
+            self.ring.append(samples)
+            x = to16k.resample_chunk(samples)
+            if self.paused.is_set() or (self.muted and self.muted()):
+                self.segmenter.reset(len(x))
+                continue
+            for chunk, ended_at, start in self.segmenter.feed(x, time.perf_counter()):
+                ref = self.ring.slice(int(start * ratio), int((start + len(chunk)) * ratio))
+                self.on_chunk(chunk, ended_at, ref)

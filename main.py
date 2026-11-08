@@ -1,9 +1,10 @@
 """Windows で流れている英語の音声をリアルタイムで日本語字幕にする常駐ツール
 
 音声認識は 2 方式 (トレイで切り替え):
-- whisper: 既定の出力デバイスを WASAPI ループバックで録り、VAD で区切って faster-whisper で文字起こし
+- whisper: PC で鳴っている音をループバックで録り、VAD で区切って faster-whisper で文字起こし
 - livecaptions: Windows のライブキャプションの字幕テキストを UI Automation で読む
 どちらも確定した文を Strata (OpenAI 互換 API) で日本語に訳し、最前面の字幕ウィンドウに出す。
+読み上げをオンにすると、訳文を元の話し手の声をまねて読み上げる (tts.py)。
 """
 
 import argparse
@@ -17,11 +18,11 @@ import threading
 import time
 from datetime import datetime
 
-from audio import SAMPLE_RATE, Capture, FileAudio, LoopbackAudio, output_devices
+from audio import ALL, CAPTURE_RATE, SAMPLE_RATE, Capture, FileAudio, LoopbackAudio, output_devices
 from hotkeys import Hotkeys
 from livecaptions import LiveCaptionsSource
 from overlay import Overlay
-from sentences import FragmentMerger, RecentFilter, Unit
+from sentences import FragmentMerger, RecentFilter, Unit, VoiceRef, pick_ref
 from settings import ROOT, Settings
 from tray import ASR_LABELS, Tray
 from translator import MAX_BATCH_CHARS, Profile, StrataUnavailable, Translator, list_profiles
@@ -30,7 +31,7 @@ LOG_DIR = ROOT / "logs"
 PROFILE_DIR = ROOT / "profiles"
 STRATA_CMD = os.path.expandvars(r"%LOCALAPPDATA%\Strata\terminal\current\bin\strata.cmd")
 STALE_SEC = 20.0  # Strata の復旧を待つ間に、これより古くなった文は訳さない
-STATUS_ORDER = ("pause", "strata", "source", "vram", "notice")
+STATUS_ORDER = ("pause", "strata", "source", "tts", "vram", "notice")
 log = logging.getLogger("live-subs")
 
 
@@ -57,10 +58,27 @@ class WhisperSource:
         self.transcriber = self.app.load_transcriber()
         self.transcriber.initial_prompt = self.app.whisper_prompt()
         s = self.app.settings
-        audio = FileAudio(self.app.args.file) if self.app.args.file else LoopbackAudio(s["capture_device"])
-        self.capture = Capture(lambda c, t: self.chunks.put((c, t)), audio, s["min_silence_ms"], s["max_chunk_sec"])
+        if self.app.args.file:
+            audio = FileAudio(self.app.args.file)
+        elif s["capture_device"] == ALL:
+            from process_loopback import ProcessLoopbackAudio
+
+            audio = ProcessLoopbackAudio(CAPTURE_RATE)
+        else:
+            audio = LoopbackAudio(s["capture_device"])
+        self.capture = Capture(lambda c, t, r: self.chunks.put((c, t, r)), audio, s["min_silence_ms"], s["max_chunk_sec"])
         self.capture.paused = self.paused
-        self.capture.start()
+        try:
+            self.capture.start()
+        except Exception:
+            if s["capture_device"] != ALL or self.app.args.file:
+                raise
+            log.warning("プロセス単位のループバックを使えないので、出力デバイスごとのループバックを足し合わせます", exc_info=True)
+            self.capture.audio = audio = LoopbackAudio(ALL)
+            self.capture.start()
+        if isinstance(audio, LoopbackAudio):
+            # デバイスのループバックには読み上げの音も入るので、読み上げている間は録らない (訳し直さないように)
+            self.capture.muted = self.app.tts_playing
         log.info("Whisper 方式で開始 (入力: %s)", self.capture.audio.device_name)
         threading.Thread(target=self._asr_loop, daemon=True, name="asr").start()
 
@@ -76,7 +94,7 @@ class WhisperSource:
     def _asr_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                chunk, ended_at = self.chunks.get(timeout=0.2)
+                chunk, ended_at, ref_audio = self.chunks.get(timeout=0.2)
             except queue.Empty:
                 chunk = None
             units = []
@@ -92,7 +110,8 @@ class WhisperSource:
                 if text:
                     audio_sec = len(chunk) / SAMPLE_RATE
                     cut = audio_sec >= self.app.settings["max_chunk_sec"] - 0.5  # 無音で区切れず上限で切った
-                    units = self.merger.add(Unit(text, ended_at, audio_sec, asr_sec, cut=cut), time.perf_counter())
+                    ref = VoiceRef(ref_audio, CAPTURE_RATE, text)  # 読み上げで声をまねる見本
+                    units = self.merger.add(Unit(text, ended_at, audio_sec, asr_sec, cut=cut, ref=ref), time.perf_counter())
             if self.paused.is_set():
                 self.merger.flush()
                 continue
@@ -110,7 +129,9 @@ class App:
         self.filter = RecentFilter()
         self.source = None
         self.transcriber = None
+        self.speaker = None  # 読み上げ (tts.Speaker)
         self._switch_lock = threading.Lock()
+        self._tts_lock = threading.Lock()
         self._status: dict[str, str] = {}
 
         self.translator = Translator(settings["strata_url"], settings["context"])
@@ -140,6 +161,9 @@ class App:
         threading.Thread(target=self._translate_loop, daemon=True, name="translate").start()
         threading.Thread(target=self._vram_monitor, daemon=True, name="vram").start()
         self.switch_asr(self.settings["asr"])
+        threading.Thread(target=self._recover_volume, daemon=True, name="recover").start()
+        if self.settings["tts"]:
+            threading.Thread(target=self._start_tts, daemon=True, name="tts-start").start()
         self.overlay.run()
 
     def quit(self) -> None:
@@ -149,6 +173,8 @@ class App:
         self.tray.stop()
         if self.source:
             self.source.stop()
+        if self.speaker:
+            self.speaker.stop()
         if self.settings["stop_strata_on_exit"] and os.path.exists(STRATA_CMD):
             self.status("notice", "Strata を止めています…")
             subprocess.Popen(
@@ -202,6 +228,68 @@ class App:
             log.info("Whisper %s (%s) を読み込みました: VRAM +%d MiB", s["whisper_model"], s["compute_type"], gpu_used_mib() - before)
         return self.transcriber
 
+    # --- 読み上げ ---
+
+    def _start_tts(self) -> None:
+        from tts import Speaker
+
+        with self._tts_lock:
+            if self.speaker:
+                return
+            self.status("tts", "読み上げのモデルを読み込み中…")
+            try:
+                self._make_room_for_tts()
+                speaker = Speaker(self.settings, lambda msg: self.status("tts", msg, clear_after=15))
+                info = speaker.start()
+            except Exception as e:
+                log.exception("読み上げを開始できませんでした")
+                self.status("tts", f"読み上げを開始できませんでした: {e}", clear_after=30)
+                return
+            log.info("読み上げを開始 (%s): %s", self.settings["tts_model"], info)
+            if not self.settings["tts"]:  # 読み込み中にオフにされた
+                speaker.stop()
+                self.status("tts", "")
+                return
+            self.speaker = speaker
+            self.status("tts", "")
+            self.status("notice", "読み上げ: オン", clear_after=4)
+            if self.settings["asr"] != "whisper":
+                self.status("notice", "読み上げ: オン (声の見本がないので、Whisper 方式に切り替えるまで読みません)", clear_after=8)
+
+    def _stop_tts(self) -> None:
+        with self._tts_lock:
+            if self.speaker:
+                self.speaker.stop()
+                self.speaker = None
+            self.status("tts", "")
+            self.status("notice", "読み上げ: オフ", clear_after=4)
+
+    def _make_room_for_tts(self) -> None:
+        """読み上げのモデルの分の VRAM が空いていなければ、Strata を予約量を増やして起動し直す"""
+        import vram
+
+        need = vram.tts_mib(self.settings) + vram.MARGIN_MIB
+        free = vram.gpu_free_mib()
+        if free >= need or not self.translator.healthy():
+            return
+        args = vram.strata_args(self.settings, loaded=True)
+        log.info("VRAM の空き %d MiB < 読み上げに要る %d MiB なので Strata を起動し直します: %s", free, need, " ".join(args))
+        self.status("tts", "読み上げの分の VRAM を空けるため、Strata を起動し直しています (1 分ほど)…")
+        r = subprocess.run(["cmd", "/c", STRATA_CMD, "launch", "--preset", self.settings["strata_preset"], *args,
+                            "--restart", "--yes", "--no-tui"],
+                           capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=900)
+        if r.returncode:
+            log.warning("Strata を起動し直せませんでした: %s", r.stdout.decode("utf-8", "replace")[-2000:])
+        self.status("tts", "読み上げのモデルを読み込み中…")
+
+    def _recover_volume(self) -> None:
+        try:
+            from tts import Ducker
+
+            Ducker.recover()
+        except Exception:
+            log.warning("前回下げた音量を戻せませんでした", exc_info=True)
+
     def whisper_prompt(self) -> str | None:
         return self.profile.whisper_prompt() if self.profile else None
 
@@ -233,6 +321,25 @@ class App:
         self.tray.refresh()
         if self.settings["asr"] == "whisper":
             threading.Thread(target=self._start_source, daemon=True, name="switch").start()
+
+    def toggle_tts(self) -> None:
+        self.settings["tts"] = not self.settings["tts"]
+        self.settings.save()
+        self.tray.refresh()
+        threading.Thread(target=self._start_tts if self.settings["tts"] else self._stop_tts, daemon=True).start()
+
+    def toggle_duck(self) -> None:
+        self.settings["tts_duck"] = not self.settings["tts_duck"]
+        self.settings.save()
+        self.tray.refresh()
+
+    def set_tts_output(self, target: str) -> None:
+        self.settings["tts_output"] = target
+        self.settings.save()
+        self.tray.refresh()
+
+    def tts_playing(self) -> bool:
+        return bool(self.speaker and self.speaker.playing)
 
     def output_device_names(self) -> list[str]:
         try:
@@ -295,7 +402,7 @@ class App:
                     if nxt is None:
                         return
                     unit = Unit(f"{unit.text} {nxt.text}", nxt.ended_at, unit.audio_sec + nxt.audio_sec,
-                                unit.asr_sec + nxt.asr_sec, unit.parts + nxt.parts)
+                                unit.asr_sec + nxt.asr_sec, unit.parts + nxt.parts, ref=pick_ref(unit.ref, nxt.ref))
                 if self.paused:
                     continue
                 if self.filter.seen(unit.text, time.perf_counter()):
@@ -332,6 +439,8 @@ class App:
 
                 done = time.perf_counter()
                 self.overlay.show(unit.text, ja)
+                if self.speaker and ja and not ja.startswith("[翻訳エラー]"):
+                    self.speaker.say(ja, unit.ref, unit.ended_at)
                 backlog = self.units.qsize()
                 mode = self.source.name if self.source else "-"
                 log.info(

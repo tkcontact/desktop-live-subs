@@ -49,9 +49,15 @@ class Tray:
         def device_item(target, label):
             return Item(label, lambda: app.set_capture_device(target), checked=lambda _: s["capture_device"] == target, radio=True)
 
+        def output_item(target, label):
+            return Item(label, lambda: app.set_tts_output(target), checked=lambda _: s["tts_output"] == target, radio=True)
+
+        names = app.output_device_names()
         profiles = [profile_item(None), *(profile_item(n) for n in app.profile_names())]
         devices = [device_item("all", "すべての出力デバイス"), device_item("default", "既定の出力デバイス"), Menu.SEPARATOR,
-                   *(device_item(n, n) for n in app.output_device_names())]
+                   *(device_item(n, n) for n in names)]
+        outputs = [output_item("auto", "自動 (元の音が鳴っているデバイス)"), output_item("default", "既定の出力デバイス"),
+                   Menu.SEPARATOR, *(output_item(n, n) for n in names)]
         return Menu(
             Item("一時停止", lambda: app.toggle_pause(), checked=lambda _: app.paused),
             Item("字幕を表示", lambda: app.toggle_visible(), checked=lambda _: s["visible"]),
@@ -60,6 +66,12 @@ class Tray:
             Menu.SEPARATOR,
             Item("音声認識", Menu(asr_item("whisper"), asr_item("livecaptions"))),
             Item("音声の取得元 (Whisper)", Menu(*devices, Menu.SEPARATOR, Item("一覧を読み直す", lambda: self.refresh()))),
+            Item("読み上げ", Menu(
+                Item("日本語で読み上げる (元の声をまねる)", lambda: app.toggle_tts(), checked=lambda _: s["tts"]),
+                Item("読み上げ中は元の音を小さくする", lambda: app.toggle_duck(), checked=lambda _: s["tts_duck"]),
+                Menu.SEPARATOR,
+                Item("出力先", Menu(*outputs)),
+            )),
             Item("プロファイル", Menu(*profiles, Menu.SEPARATOR,
                                      Item("一覧を読み直す", lambda: self.refresh()),
                                      Item("profiles フォルダを開く", lambda: app.open_folder("profiles")))),

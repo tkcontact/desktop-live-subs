@@ -25,6 +25,26 @@ def normalize(text: str) -> str:
 
 
 @dataclass
+class VoiceRef:
+    """読み上げで声をまねる見本: 1 つの発話の音声と、その文字起こし"""
+
+    audio: object  # float32 mono の numpy 配列
+    rate: int
+    text: str
+
+    @property
+    def seconds(self) -> float:
+        return len(self.audio) / self.rate
+
+
+def pick_ref(old: VoiceRef | None, new: VoiceRef | None, min_sec: float = 2.0) -> VoiceRef | None:
+    """断片をまとめるときの見本: 新しい方が短すぎなければ新しい方 (今の話し方に近い)、そうでなければ長い方"""
+    if new is None or (old is not None and new.seconds < min_sec and old.seconds > new.seconds):
+        return old
+    return new
+
+
+@dataclass
 class Unit:
     """翻訳に回す 1 まとまり"""
 
@@ -34,6 +54,7 @@ class Unit:
     asr_sec: float = 0.0
     parts: int = 1  # まとめた断片の数
     cut: bool = False  # 無音で区切れず、長さの上限で切った (文の途中かもしれない)
+    ref: VoiceRef | None = None  # 読み上げの声の見本 (Whisper 方式のみ)
 
 
 def split_tail(text: str) -> tuple[str, str]:
@@ -80,6 +101,7 @@ class FragmentMerger:
                 p.asr_sec + unit.asr_sec,
                 p.parts + unit.parts,
                 unit.cut,
+                pick_ref(p.ref, unit.ref),
             )
             self.pending = None
 
@@ -93,8 +115,8 @@ class FragmentMerger:
         if word_count(tail) > self.tail_words:
             return [unit]
         if head and word_count(head) >= self.min_words:
-            ready = Unit(head, unit.ended_at, unit.audio_sec, unit.asr_sec, unit.parts)
-            self._hold(Unit(tail, unit.ended_at, cut=unit.cut), now, self.tail_max_sec)
+            ready = Unit(head, unit.ended_at, unit.audio_sec, unit.asr_sec, unit.parts, ref=unit.ref)
+            self._hold(Unit(tail, unit.ended_at, cut=unit.cut, ref=unit.ref), now, self.tail_max_sec)
             return [ready]
         if word_count(text) > 2 * self.tail_words:
             return [unit]  # 区切れないまま長くなったものは待たずに出す
