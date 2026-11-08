@@ -43,8 +43,9 @@ DEFAULTS = {
     "tts_duck": True,  # 読み上げている間、ほかのアプリの音を下げる
     "tts_duck_level": 0.3,  # 下げるときの倍率
     "tts_volume": 1.0,
+    "tts_speed": 1.15,  # 読む速さ (Qwen3-TTS の日本語はゆっくりめなので少し速くする)
     "tts_max_lag_sec": 10.0,  # 元の発話からこれ以上遅れた文は読まずに飛ばす
-    "tts_max_speed": 1.35,  # 遅れを取り戻すために速く読むときの上限
+    "tts_max_speed": 1.5,  # 遅れを取り戻すために速く読むときの上限
 }
 
 

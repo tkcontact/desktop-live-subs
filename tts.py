@@ -511,9 +511,9 @@ class Speaker:
             if lag > s["tts_max_lag_sec"]:
                 log.info("読み上げが %.1f 秒遅れているので飛ばします: %s", lag, job.text)
                 continue
-            # 前の読み上げがまだ鳴っていたり次が待っていたりする (詰まっている) ときだけ、少し速く読んで追いつく。
-            # 翻訳を待つ分の遅れ (3 秒前後) はいつもあるので数えない
-            speed = min(s["tts_max_speed"], 1.0 + 0.15 * max(0.0, wait - 0.5) + 0.1 * backlog)
+            # いつも tts_speed 倍で読み、前の読み上げがまだ鳴っていたり次が待っていたりする (詰まっている) ときは
+            # さらに速く読んで追いつく。翻訳を待つ分の遅れ (3 秒前後) はいつもあるので数えない
+            speed = min(s["tts_max_speed"], s["tts_speed"] + 0.15 * max(0.0, wait - 0.5) + 0.1 * backlog)
             tsm = wsola(1, speed=speed) if speed > 1.02 else None
             try:
                 for x in self.worker.synthesize(split_pieces(job.text), job.ref, s["tts_icl"]):

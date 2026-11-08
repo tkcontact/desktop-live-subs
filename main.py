@@ -131,6 +131,7 @@ class App:
         self.transcriber = None
         self.speaker = None  # 読み上げ (tts.Speaker)
         self._switch_lock = threading.Lock()
+        self._whisper_lock = threading.Lock()
         self._tts_lock = threading.Lock()
         self._status: dict[str, str] = {}
 
@@ -217,6 +218,10 @@ class App:
 
     def load_transcriber(self):
         """Whisper は一度だけ読み込み、方式を切り替えても持っておく"""
+        with self._whisper_lock:
+            return self._load_transcriber()
+
+    def _load_transcriber(self):
         if self.transcriber is None:
             from asr import Transcriber
             from vram import gpu_used_mib
@@ -253,6 +258,13 @@ class App:
             self.speaker = speaker
             self.status("tts", "")
             self.status("notice", "読み上げ: オン", clear_after=4)
+            import vram
+
+            free = vram.gpu_free_mib()
+            log.info("読み上げを載せた後の VRAM の空き: %d MiB", free)
+            if free < 300:
+                self.status("tts", f"VRAM の空きが {free} MiB しかなく、読み上げと翻訳が遅くなります。"
+                                   "start.cmd から起動し直してください", clear_after=30)
             if self.settings["asr"] != "whisper":
                 self.status("notice", "読み上げ: オン (声の見本がないので、Whisper 方式に切り替えるまで読みません)", clear_after=8)
 
@@ -268,9 +280,16 @@ class App:
         """読み上げのモデルの分の VRAM が空いていなければ、Strata を予約量を増やして起動し直す"""
         import vram
 
+        if self.settings["asr"] == "whisper":
+            self.load_transcriber()  # Whisper を読み込み終えてから空きを見る (読み込み中だと空きが揺れる)
         need = vram.tts_mib(self.settings) + vram.MARGIN_MIB
-        free = vram.gpu_free_mib()
-        if free >= need or not self.translator.healthy():
+        # 前に動いていた読み上げのプロセスが VRAM を返し終えていないことがあるので、少し待って見直す
+        for _ in range(5):
+            free = vram.gpu_free_mib()
+            if free >= need:
+                return
+            time.sleep(1)
+        if not self.translator.healthy():
             return
         args = vram.strata_args(self.settings, loaded=True)
         log.info("VRAM の空き %d MiB < 読み上げに要る %d MiB なので Strata を起動し直します: %s", free, need, " ".join(args))
@@ -280,6 +299,11 @@ class App:
                            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=900)
         if r.returncode:
             log.warning("Strata を起動し直せませんでした: %s", r.stdout.decode("utf-8", "replace")[-2000:])
+        # Strata が空きを見てキャッシュの大きさを決め終える前に読み上げのモデルを載せると、その分まで
+        # 空きとして数えられて VRAM が溢れる (溢れた分はメインメモリに回されて、読み上げも翻訳も遅くなる)
+        deadline = time.perf_counter() + 300
+        while not self.translator.healthy() and time.perf_counter() < deadline:
+            time.sleep(2)
         self.status("tts", "読み上げのモデルを読み込み中…")
 
     def _recover_volume(self) -> None:
