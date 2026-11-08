@@ -1,0 +1,14 @@
+{
+  "description": "An online action RPG stream. The streamer talks with chat while fighting bosses and trading items. Gamer slang is common.",
+  "proper_nouns": ["Exalted Orb", "Chaos Orb", "Divine Orb", "Atlas", "Waystone", "Pinnacle boss", "Ascendancy"],
+  "glossary": {
+    "Exalted Orb": "エクザルテッドオーブ",
+    "Chaos Orb": "カオスオーブ",
+    "Divine Orb": "ディヴァインオーブ",
+    "Waystone": "ウェイストーン",
+    "Ascendancy": "アセンダンシー",
+    "boss": "ボス",
+    "loot": "ドロップ品",
+    "build": "ビルド"
+  }
+}
