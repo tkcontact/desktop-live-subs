@@ -122,7 +122,7 @@ def measure_tts(settings: Settings) -> dict:
         rng = np.random.default_rng(0)
         ref = VoiceRef((rng.standard_normal(24000 * 4) * 0.05).astype(np.float32), 24000, "Hello there, this is just a test.")
         t = time.perf_counter()
-        samples = sum(len(x) for x in worker.synthesize(["こんにちは、これは読み上げの確認です。"], ref, icl=True))
+        samples = sum(len(x) for x in worker.synthesize(["こんにちは、これは読み上げの確認です。"], ref, "clone_icl"))
         gen_sec = time.perf_counter() - t
     worker.stop()
     return {

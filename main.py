@@ -265,7 +265,7 @@ class App:
             if free < 300:
                 self.status("tts", f"VRAM の空きが {free} MiB しかなく、読み上げと翻訳が遅くなります。"
                                    "start.cmd から起動し直してください", clear_after=30)
-            if self.settings["asr"] != "whisper":
+            if self.settings["asr"] != "whisper" and self.settings["tts_voice"] != "native":
                 self.status("notice", "読み上げ: オン (声の見本がないので、Whisper 方式に切り替えるまで読みません)", clear_after=8)
 
     def _stop_tts(self) -> None:
@@ -352,8 +352,10 @@ class App:
         self.tray.refresh()
         threading.Thread(target=self._start_tts if self.settings["tts"] else self._stop_tts, daemon=True).start()
 
-    def toggle_icl(self) -> None:
-        self.settings["tts_icl"] = not self.settings["tts_icl"]
+    def set_tts_voice(self, voice: str, native: str | None = None) -> None:
+        self.settings["tts_voice"] = voice
+        if native:
+            self.settings["tts_native"] = native
         self.settings.save()
         self.tray.refresh()
 

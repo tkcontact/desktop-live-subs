@@ -1,8 +1,9 @@
-"""訳した日本語を、元の話し手の声色・話し方をまねて読み上げる
+"""訳した日本語を読み上げる
 
-声のまね (ボイスクローン) は Qwen3-TTS を CUDA Graph で速くした faster-qwen3-tts。見本には、その文の英語の
-発話の音声を使うので、話し手が変わっても声についてくる。既定では見本から声質 (話者の埋め込み) だけを取る。
-見本の音声と文字起こしの続きとして読ませる (ICL) と話し方や抑揚までまねるが、英語なまりの日本語になる。
+読み上げは Qwen3-TTS を CUDA Graph で速くした faster-qwen3-tts のボイスクローン。声は 3 通り (tts_voice):
+- native: 日本語ネイティブの声 (voices/male.wav, female.wav を見本にする)。英語の発話の声の高さで男女を選ぶ
+- clone: その文の英語の発話から声質 (話者の埋め込み) だけを取ってまねる。声は似るが少しなまる
+- clone_icl: 英語の発話の音声と文字起こしの続きとして読ませる。抑揚やテンションまでまねるが、英語なまりになる
 モデルは子プロセスで動かす (PyTorch は重く、生成中に録音や字幕ウィンドウのスレッドを待たせないように)。
 読み上げはこのプロセスから鳴らすので、プロセス単位のループバック録音には入らない。
 
@@ -33,6 +34,8 @@ TTS_RATE = 24000
 MIN_REF_SEC = 1.5  # これより短い見本は声をまねにくいので、直前の見本を使う
 REF_SILENCE_SEC = 0.5  # 見本の最後の音が読み上げの頭に混ざらないよう、見本の後ろに足す無音
 MAX_PIECE_CHARS = 40  # 長い訳文は文ごとに分けて生成する (一度に生成する長さを抑える)
+VOICES = ROOT / "voices"  # 日本語ネイティブの声の見本 (make_voices.py で作る)
+NATIVE_VOICES = ("male", "female")
 DUCK_FILE = ROOT / "ducked.json"  # 音量を下げている間だけある。落ちたときは次の起動で戻す
 _KEY_ENV = "LIVE_SUBS_TTS_KEY"
 log = logging.getLogger(__name__)
@@ -58,6 +61,38 @@ def split_pieces(text: str) -> list[str]:
         elif s:
             out.append(s)
     return out
+
+
+def median_f0(audio: np.ndarray, rate: int) -> float | None:
+    """声の高さ (Hz) の中央値。声がはっきりしない (短い・小さい) ときは None"""
+    if len(audio) < rate * 0.5:
+        return None
+    import librosa
+
+    f0 = librosa.yin(audio, fmin=65, fmax=400, sr=rate, frame_length=2048, hop_length=512)
+    rms = librosa.feature.rms(y=audio, frame_length=2048, hop_length=512)[0]
+    n = min(len(f0), len(rms))
+    f0, rms = f0[:n], rms[:n]
+    voiced = f0[(rms > rms.max() * 0.25) & (f0 > 70) & (f0 < 380)]  # 大きめの音の部分だけ (無声音や BGM を避ける)
+    return float(np.median(voiced)) if len(voiced) >= 10 else None
+
+
+class _NativePicker:
+    """英語の発話の声の高さで、ネイティブの声の男女を選ぶ。同じ人で行ったり来たりしないよう、切り替えに幅を持たせる"""
+
+    def __init__(self):
+        self.current: str | None = None
+
+    def pick(self, audio: np.ndarray, rate: int) -> tuple[str, float | None]:
+        f0 = median_f0(audio, rate)
+        if f0 is not None:
+            if self.current is None:
+                self.current = "male" if f0 < 165 else "female"
+            elif self.current == "male" and f0 > 180:
+                self.current = "female"
+            elif self.current == "female" and f0 < 150:
+                self.current = "male"
+        return self.current or "male", f0
 
 
 def _max_tokens(text: str) -> int:
@@ -104,10 +139,12 @@ class TTSWorker:
         self.info = msg[1]
         return self.info
 
-    def synthesize(self, texts: list[str], ref: VoiceRef, icl: bool = False):
-        """texts を ref の声で順に読んだ音声 (24kHz float32) を少しずつ返す。終わると self.last に所要時間が入る。
-        icl なら見本の話し方までまねる。途中でやめると子プロセスとのやりとりがずれるので、最後まで読み切ること。"""
-        self.conn.send(("say", texts, np.asarray(ref.audio, np.float32), ref.rate, ref.text, icl))
+    def synthesize(self, texts: list[str], ref: VoiceRef | None, voice: str = "native", native: str = "auto"):
+        """texts を順に読んだ音声 (24kHz float32) を少しずつ返す。終わると self.last に所要時間などが入る。
+        voice は native / clone / clone_icl、native はネイティブの声の男女 (auto / male / female)。
+        途中でやめると子プロセスとのやりとりがずれるので、最後まで読み切ること。"""
+        audio = np.asarray(ref.audio, np.float32) if ref else np.zeros(0, np.float32)
+        self.conn.send(("say", texts, audio, ref.rate if ref else TTS_RATE, ref.text if ref else "", voice, native))
         while True:
             msg = self.conn.recv()
             if msg[0] == "chunk":
@@ -156,13 +193,26 @@ def _worker(address: str, model_name: str) -> None:
         t0 = time.perf_counter()
         model = FasterQwen3TTS.from_pretrained(model_name, max_seq_len=1024)
         model.warmup(prefill_len=100)
-        info = {"load_sec": round(time.perf_counter() - t0, 1), "vram_mib": gpu_used_mib() - before}
+        natives = {}
+        for name in NATIVE_VOICES:
+            wav, txt = VOICES / f"{name}.wav", VOICES / f"{name}.txt"
+            if wav.exists() and txt.exists():
+                import soundfile as sf
+
+                x, sr = sf.read(wav, dtype="float32")
+                x = np.concatenate([x.mean(axis=1) if x.ndim > 1 else x, np.zeros(int(sr * REF_SILENCE_SEC), np.float32)])
+                natives[name] = model.model.create_voice_clone_prompt(
+                    ref_audio=(x, sr), ref_text=txt.read_text(encoding="utf-8").strip())
+        info = {"load_sec": round(time.perf_counter() - t0, 1), "vram_mib": gpu_used_mib() - before,
+                "voices": sorted(natives)}
         log.info("%s を読み込みました: %s", model_name, info)
         conn.send(("ready", info))
     except Exception as e:
         log.exception("読み上げのモデルを読み込めませんでした")
         conn.send(("error", f"読み上げのモデルを読み込めませんでした: {type(e).__name__}: {e}"))
         return
+
+    picker = _NativePicker()
 
     while True:
         try:
@@ -171,17 +221,26 @@ def _worker(address: str, model_name: str) -> None:
             return
         if msg[0] == "quit":
             return
-        _, texts, audio, rate, ref_text, icl = msg
+        _, texts, audio, rate, ref_text, voice, native = msg
         try:
             t0 = time.perf_counter()
             # 見本の音量をそろえる (読み上げ中は元の音を下げているので、その間に録った見本は小さい)
             rms = float(np.sqrt(np.mean(audio**2))) if len(audio) else 0.0
             audio = np.clip(audio * (0.08 / rms), -1.0, 1.0) if rms > 1e-4 else audio
-            if icl:
+            if voice == "clone_icl" and len(audio) and ref_text:
                 ref = np.concatenate([audio, np.zeros(int(rate * REF_SILENCE_SEC), np.float32)])
                 prompt = model.model.create_voice_clone_prompt(ref_audio=(ref, rate), ref_text=ref_text)
-            else:
+                used = voice
+            elif (voice == "clone" or not natives) and len(audio):
                 prompt = model.model.create_voice_clone_prompt(ref_audio=(audio, rate), x_vector_only_mode=True)
+                used = "clone"
+            elif natives:
+                name, f0 = (native, None) if native in natives else picker.pick(audio, rate)
+                name = name if name in natives else next(iter(natives))
+                prompt = natives[name]
+                used = f"native:{name}" + (f" ({f0:.0f}Hz)" if f0 else "")
+            else:
+                raise RuntimeError("声の見本がありません (voices/ に male.wav などを置くか、Whisper 方式にしてください)")
             first, n = None, 0
             for text in texts:
                 for chunk, sr, _ in model.generate_voice_clone_streaming(
@@ -197,7 +256,8 @@ def _worker(address: str, model_name: str) -> None:
                         x = soxr.resample(x, sr, TTS_RATE)
                     conn.send(("chunk", x))
                     n += len(x)
-            conn.send(("done", {"first_sec": first or 0.0, "gen_sec": time.perf_counter() - t0, "audio_sec": n / TTS_RATE}))
+            conn.send(("done", {"first_sec": first or 0.0, "gen_sec": time.perf_counter() - t0,
+                                "audio_sec": n / TTS_RATE, "voice": used}))
         except Exception as e:
             log.exception("読み上げを生成できませんでした: %s", texts)
             conn.send(("error", f"{type(e).__name__}: {e}"))
@@ -487,7 +547,7 @@ class Speaker:
             ref = self._last_ref or ref  # 短すぎる見本 (「Yeah.」だけなど) より、直前の話し手の声を使う
         else:
             self._last_ref = ref
-        if ref is None:
+        if ref is None and self.settings["tts_voice"] != "native":
             log.debug("声の見本がないので読み上げません: %s", text)
             return
         with self._cv:
@@ -516,7 +576,7 @@ class Speaker:
             speed = min(s["tts_max_speed"], s["tts_speed"] + 0.15 * max(0.0, wait - 0.5) + 0.1 * backlog)
             tsm = wsola(1, speed=speed) if speed > 1.02 else None
             try:
-                for x in self.worker.synthesize(split_pieces(job.text), job.ref, s["tts_icl"]):
+                for x in self.worker.synthesize(split_pieces(job.text), job.ref, s["tts_voice"], s["tts_native"]):
                     self.player.feed(_stretch(tsm, x))
                 if tsm:
                     self.player.feed(_stretch(tsm, None))
@@ -529,8 +589,8 @@ class Speaker:
                 self.on_error(f"読み上げに失敗しました: {e}")
                 continue
             st = self.worker.last
-            log.info("読み上げ 生成%5.2fs(初音%4.2fs) 音声%4.1fs ×%.2f 遅れ%4.1fs 待ち%d 見本%.1fs → %s | %s",
-                     st["gen_sec"], st["first_sec"], st["audio_sec"], speed, lag, backlog, job.ref.seconds,
+            log.info("読み上げ 生成%5.2fs(初音%4.2fs) 音声%4.1fs ×%.2f 遅れ%4.1fs 待ち%d 声 %s → %s | %s",
+                     st["gen_sec"], st["first_sec"], st["audio_sec"], speed, lag, backlog, st.get("voice"),
                      self.player.device_name or "-", job.text)
 
 

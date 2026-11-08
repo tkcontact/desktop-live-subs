@@ -49,6 +49,12 @@ class Tray:
         def device_item(target, label):
             return Item(label, lambda: app.set_capture_device(target), checked=lambda _: s["capture_device"] == target, radio=True)
 
+        def voice_item(voice, native, label):
+            def checked(_):
+                return s["tts_voice"] == voice and (native is None or s["tts_native"] == native)
+
+            return Item(label, lambda: app.set_tts_voice(voice, native), checked=checked, radio=True)
+
         def output_item(target, label):
             return Item(label, lambda: app.set_tts_output(target), checked=lambda _: s["tts_output"] == target, radio=True)
 
@@ -68,7 +74,14 @@ class Tray:
             Item("音声の取得元 (Whisper)", Menu(*devices, Menu.SEPARATOR, Item("一覧を読み直す", lambda: self.refresh()))),
             Item("読み上げ", Menu(
                 Item("日本語で読み上げる (元の声をまねる)", lambda: app.toggle_tts(), checked=lambda _: s["tts"]),
-                Item("話し方までまねる (英語なまりになる)", lambda: app.toggle_icl(), checked=lambda _: s["tts_icl"]),
+                Item("声", Menu(
+                    voice_item("native", "auto", "日本語ネイティブ (男女は元の声の高さで選ぶ)"),
+                    voice_item("native", "male", "日本語ネイティブ (男性)"),
+                    voice_item("native", "female", "日本語ネイティブ (女性)"),
+                    Menu.SEPARATOR,
+                    voice_item("clone", None, "元の声をまねる (少しなまる)"),
+                    voice_item("clone_icl", None, "元の声と話し方までまねる (英語なまりになる)"),
+                )),
                 Item("読み上げ中は元の音を小さくする", lambda: app.toggle_duck(), checked=lambda _: s["tts_duck"]),
                 Menu.SEPARATOR,
                 Item("出力先", Menu(*outputs)),
