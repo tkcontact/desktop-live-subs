@@ -33,23 +33,42 @@ class Unit:
     audio_sec: float = 0.0
     asr_sec: float = 0.0
     parts: int = 1  # まとめた断片の数
+    cut: bool = False  # 無音で区切れず、長さの上限で切った (文の途中かもしれない)
+
+
+def split_tail(text: str) -> tuple[str, str]:
+    """(それより前, 最後の文) に分ける。文の区切りがなければ最後のカンマで分ける。"""
+    parts = _SPLIT.split(text)
+    if len(parts) > 1:
+        tail = parts[-1]
+    else:
+        i = text.rfind(", ")
+        if i < 0:
+            return "", text
+        tail = text[i + 2 :]
+    return text[: len(text) - len(tail)].strip(), tail
 
 
 class FragmentMerger:
-    """短すぎる断片を次とまとめ、文として自然な単位で出す。
+    """短すぎる断片や文の途中で切れたものを次とまとめ、文として自然な単位で出す。
 
-    - 文末で終わっていて min_words 語以上ならそのまま出す。
-    - 文の途中で終わっていて末尾の未完の部分が短ければ、そこだけ次の断片を待つ。
-    - 待っている断片は、発話が止んで hold_sec 経つか、max_hold_sec 経てば出す。
+    - 文末で終わっていて min_words 語以上ならそのまま出す。短ければ次を待つが、長くは待たない (short_max_sec)。
+    - 文の途中で終わっている (または長さの上限で切れた) ときは、最後の文 (なければ最後のカンマ以降) が
+      tail_words 語以下ならそこだけ次の断片を待つ。Whisper は切れ目に句点を付けがちなので、
+      上限で切れたものは句点で終わっていても途中とみなす。喋り続けている間は次の断片まで待つ (tail_max_sec)。
+    - 発話が止んで hold_sec 経てば、待っている断片はそのまま出す。
     """
 
-    def __init__(self, min_words: int = 4, tail_words: int = 6, hold_sec: float = 1.2, max_hold_sec: float = 4.0):
+    def __init__(self, min_words: int = 4, tail_words: int = 12, hold_sec: float = 1.2,
+                 short_max_sec: float = 2.5, tail_max_sec: float = 9.0):
         self.min_words = min_words
         self.tail_words = tail_words
         self.hold_sec = hold_sec
-        self.max_hold_sec = max_hold_sec
+        self.short_max_sec = short_max_sec
+        self.tail_max_sec = tail_max_sec
         self.pending: Unit | None = None
         self.held_at = 0.0
+        self.max_wait = 0.0
 
     def add(self, unit: Unit, now: float) -> list[Unit]:
         if self.pending:
@@ -60,31 +79,32 @@ class FragmentMerger:
                 p.audio_sec + unit.audio_sec,
                 p.asr_sec + unit.asr_sec,
                 p.parts + unit.parts,
+                unit.cut,
             )
             self.pending = None
 
         text = unit.text.strip()
-        if _EOS.search(text):
+        if not unit.cut and _EOS.search(text):
             if word_count(text) >= self.min_words:
                 return [unit]
-            return self._hold(unit, now)
+            return self._hold(unit, now, self.short_max_sec)
 
-        sentences = _SPLIT.split(text)
-        tail = sentences[-1]
-        if word_count(tail) >= self.tail_words:
+        head, tail = split_tail(text)
+        if word_count(tail) > self.tail_words:
             return [unit]
-        head = text[: len(text) - len(tail)].strip()
         if head and word_count(head) >= self.min_words:
             ready = Unit(head, unit.ended_at, unit.audio_sec, unit.asr_sec, unit.parts)
-            self._hold(Unit(tail, unit.ended_at), now)
+            self._hold(Unit(tail, unit.ended_at, cut=unit.cut), now, self.tail_max_sec)
             return [ready]
-        return self._hold(unit, now)
+        if word_count(text) > 2 * self.tail_words:
+            return [unit]  # 区切れないまま長くなったものは待たずに出す
+        return self._hold(unit, now, self.tail_max_sec)
 
     def flush_due(self, now: float, speaking: bool) -> list[Unit]:
         if not self.pending:
             return []
         waited = now - self.held_at
-        if waited >= self.max_hold_sec or (not speaking and waited >= self.hold_sec):
+        if waited >= self.max_wait or (not speaking and waited >= self.hold_sec):
             return self.flush()
         return []
 
@@ -93,9 +113,10 @@ class FragmentMerger:
         self.pending = None
         return out
 
-    def _hold(self, unit: Unit, now: float) -> list[Unit]:
+    def _hold(self, unit: Unit, now: float, max_wait: float) -> list[Unit]:
         self.pending = unit
         self.held_at = now
+        self.max_wait = max_wait
         return []
 
 

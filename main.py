@@ -17,7 +17,7 @@ import threading
 import time
 from datetime import datetime
 
-from audio import SAMPLE_RATE, Capture, FileAudio
+from audio import SAMPLE_RATE, Capture, FileAudio, LoopbackAudio, output_devices
 from hotkeys import Hotkeys
 from livecaptions import LiveCaptionsSource
 from overlay import Overlay
@@ -57,7 +57,7 @@ class WhisperSource:
         self.transcriber = self.app.load_transcriber()
         self.transcriber.initial_prompt = self.app.whisper_prompt()
         s = self.app.settings
-        audio = FileAudio(self.app.args.file) if self.app.args.file else None
+        audio = FileAudio(self.app.args.file) if self.app.args.file else LoopbackAudio(s["capture_device"])
         self.capture = Capture(lambda c, t: self.chunks.put((c, t)), audio, s["min_silence_ms"], s["max_chunk_sec"])
         self.capture.paused = self.paused
         self.capture.start()
@@ -90,7 +90,9 @@ class WhisperSource:
                 asr_sec = time.perf_counter() - t0
                 log.debug("ASR %.2fs (音声 %.1fs): %s", asr_sec, len(chunk) / SAMPLE_RATE, text)
                 if text:
-                    units = self.merger.add(Unit(text, ended_at, len(chunk) / SAMPLE_RATE, asr_sec), time.perf_counter())
+                    audio_sec = len(chunk) / SAMPLE_RATE
+                    cut = audio_sec >= self.app.settings["max_chunk_sec"] - 0.5  # 無音で区切れず上限で切った
+                    units = self.merger.add(Unit(text, ended_at, audio_sec, asr_sec, cut=cut), time.perf_counter())
             if self.paused.is_set():
                 self.merger.flush()
                 continue
@@ -225,6 +227,20 @@ class App:
     def toggle_source(self) -> None:
         self.overlay.call(lambda: (self.overlay.set_show_source(not self.settings["show_source"]), self.tray.refresh()))
 
+    def set_capture_device(self, target: str) -> None:
+        self.settings["capture_device"] = target
+        self.settings.save()
+        self.tray.refresh()
+        if self.settings["asr"] == "whisper":
+            threading.Thread(target=self._start_source, daemon=True, name="switch").start()
+
+    def output_device_names(self) -> list[str]:
+        try:
+            return list(dict.fromkeys(name for _, name in output_devices()))
+        except Exception:
+            log.warning("出力デバイスの一覧を取得できませんでした", exc_info=True)
+            return []
+
     def profile_names(self) -> list[str]:
         return list_profiles(PROFILE_DIR)
 
@@ -287,7 +303,7 @@ class App:
                     continue
 
                 shown = time.perf_counter()
-                self.overlay.show(unit.text, "…")
+                self.overlay.show(unit.text, "…", new=True)
                 t0 = time.perf_counter()
                 while True:
                     try:
@@ -338,7 +354,7 @@ class App:
                 self.units.put(None)
                 return None
             unit = nxt
-            self.overlay.show(unit.text, "")
+            self.overlay.show(unit.text, "", new=True)
         return unit if time.perf_counter() - unit.ended_at < STALE_SEC else None
 
     def _vram_monitor(self) -> None:

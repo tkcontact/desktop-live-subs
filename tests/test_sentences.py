@@ -99,17 +99,23 @@ class FragmentMergerTest(unittest.TestCase):
         self.assertEqual([(u.text, u.parts) for u in out], [("Yeah. I think that's right.", 2)])
 
     def test_short_fragment_flushed_after_silence(self):
-        m = FragmentMerger(hold_sec=1.2, max_hold_sec=4)
+        m = FragmentMerger(hold_sec=1.2)
         m.add(Unit("Okay.", 0), 0)
         self.assertEqual(m.flush_due(1.0, speaking=False), [])
         self.assertEqual(m.flush_due(1.0, speaking=True), [])
         self.assertEqual([u.text for u in m.flush_due(1.3, speaking=False)], ["Okay."])
 
-    def test_speaking_waits_until_max_hold(self):
-        m = FragmentMerger(hold_sec=1.2, max_hold_sec=4)
+    def test_short_sentence_waits_only_briefly_while_speaking(self):
+        m = FragmentMerger(short_max_sec=2.5)
+        m.add(Unit("It's the school.", 0), 0)
+        self.assertEqual(m.flush_due(2.4, speaking=True), [])
+        self.assertEqual([u.text for u in m.flush_due(2.5, speaking=True)], ["It's the school."])
+
+    def test_unfinished_waits_for_next_chunk_while_speaking(self):
+        m = FragmentMerger(tail_max_sec=9)
         m.add(Unit("and then", 0), 0)
-        self.assertEqual(m.flush_due(3.9, speaking=True), [])
-        self.assertEqual([u.text for u in m.flush_due(4.0, speaking=True)], ["and then"])
+        self.assertEqual(m.flush_due(8.9, speaking=True), [])
+        self.assertEqual([u.text for u in m.flush_due(9.0, speaking=True)], ["and then"])
 
     def test_short_tail_waits_for_next(self):
         m = FragmentMerger()
@@ -117,6 +123,25 @@ class FragmentMergerTest(unittest.TestCase):
         self.assertEqual([u.text for u in out], ["I went to the store yesterday."])
         out = m.add(Unit("I saw him there.", 1), 1)
         self.assertEqual([u.text for u in out], ["And then I saw him there."])
+
+    def test_cut_chunk_holds_last_sentence_even_with_period(self):
+        m = FragmentMerger()
+        out = m.add(Unit("Why are we the way we are? I had a hypothesis that our brains were actually different.", 0, cut=True), 0)
+        self.assertEqual([u.text for u in out], ["Why are we the way we are?"])
+        out = m.add(Unit("than the brains of other people.", 8), 8)
+        self.assertEqual([u.text for u in out],
+                         ["I had a hypothesis that our brains were actually different. than the brains of other people."])
+
+    def test_unfinished_without_sentence_end_splits_at_comma(self):
+        m = FragmentMerger()
+        out = m.add(Unit("My behaviors always perplexed the people around me, and I wanted to explain to the world", 0, cut=True), 0)
+        self.assertEqual([u.text for u in out], ["My behaviors always perplexed the people around me,"])
+        self.assertEqual(m.pending.text, "and I wanted to explain to the world")
+
+    def test_long_unbroken_text_is_not_held(self):
+        m = FragmentMerger()
+        text = " ".join(["word"] * 30)
+        self.assertEqual([u.text for u in m.add(Unit(text, 0, cut=True), 0)], [text])
 
 
 class RecentFilterTest(unittest.TestCase):

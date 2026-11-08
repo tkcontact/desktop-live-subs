@@ -11,6 +11,8 @@ log = logging.getLogger(__name__)
 
 DEFAULTS = {
     "asr": "whisper",  # whisper | livecaptions
+    # Whisper 方式で録る出力デバイス: "all" (すべてを足し合わせる) | "default" (既定の出力デバイス) | デバイス名
+    "capture_device": "all",
     "profile": None,  # profiles/<名前>.json の名前。None はプロファイルなし
     "show_source": True,
     "click_through": True,
@@ -18,6 +20,7 @@ DEFAULTS = {
     "font_size": 24,
     "alpha": 0.8,
     "geometry": None,  # [x, 下端の y, 幅, 高さ]。None なら画面下の中央
+    "history": 1,  # 今の字幕の上に薄く残す直前の字幕の数 (0 で残さない)
     "clear_after_sec": 12,  # 新しい字幕がこの秒数来なければ消す (0 で消さない)
     "hotkeys": {"click_through": "ctrl+alt+t", "visible": "ctrl+alt+h", "pause": "ctrl+alt+p"},
     # Windows の localhost は IPv6 を先に試して 2 秒ほど待たされるので IPv4 を直接指定する

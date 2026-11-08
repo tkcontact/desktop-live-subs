@@ -108,8 +108,9 @@ def stress(settings: Settings, seconds: float, audio_path: str | None) -> dict:
     """Whisper の文字起こしと Strata の翻訳を同時に回し続け、VRAM の最大使用量とエラーを調べる"""
     import statistics
 
+    import subprocess
+
     from asr import Transcriber
-    from faster_whisper import decode_audio
     from translator import Translator
 
     tl = Translator(settings["strata_url"])
@@ -117,7 +118,13 @@ def stress(settings: Settings, seconds: float, audio_path: str | None) -> dict:
         raise SystemExit("Strata が応答しません。先に Strata を起動してください")
     tr = Transcriber(settings["whisper_model"], settings["compute_type"], settings["beam_size"])
     n = 16000 * int(settings["max_chunk_sec"])
-    audio = decode_audio(audio_path)[:n] if audio_path else np.random.default_rng(0).standard_normal(n).astype(np.float32) * 0.1
+    if audio_path:
+        # faster_whisper.decode_audio は PyAV 19 で動かないので ffmpeg で読む
+        pcm = subprocess.run(["ffmpeg", "-v", "error", "-i", audio_path, "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+                             capture_output=True, check=True).stdout
+        audio = np.frombuffer(pcm, np.int16)[:n].astype(np.float32) / 32768.0
+    else:
+        audio = np.random.default_rng(0).standard_normal(n).astype(np.float32) * 0.1
 
     stop = threading.Event()
     asr_times, llm_times, errors = [], [], []

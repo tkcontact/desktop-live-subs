@@ -9,7 +9,8 @@ rem \\wsl.localhost のフォルダは作業フォルダにできないので、
 cd /d "%LOCALAPPDATA%\desktop-live-subs"
 
 echo Whisper の VRAM 使用量を確認しています...
-for /f "usebackq delims=" %%r in (`"%VENV%\Scripts\python.exe" "%HERE%vram.py" --reserve`) do set "RESERVE=%%r"
+rem cmd /c は先頭と末尾の引用符を剥がすので、コマンド全体をもう一重の引用符で囲む
+for /f "usebackq delims=" %%r in (`""%VENV%\Scripts\python.exe" "%HERE%vram.py" --reserve"`) do set "RESERVE=%%r"
 if not defined RESERVE (
   echo VRAM の使用量を測れませんでした。setup.cmd を実行したか確認してください。
   pause

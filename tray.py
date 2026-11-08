@@ -46,14 +46,20 @@ class Tray:
         def profile_item(name):
             return Item(name or "なし", lambda: app.set_profile(name), checked=lambda _: s["profile"] == name, radio=True)
 
+        def device_item(target, label):
+            return Item(label, lambda: app.set_capture_device(target), checked=lambda _: s["capture_device"] == target, radio=True)
+
         profiles = [profile_item(None), *(profile_item(n) for n in app.profile_names())]
+        devices = [device_item("all", "すべての出力デバイス"), device_item("default", "既定の出力デバイス"), Menu.SEPARATOR,
+                   *(device_item(n, n) for n in app.output_device_names())]
         return Menu(
-            Item("一時停止", lambda: app.toggle_pause(), checked=lambda _: app.paused, default=True),
+            Item("一時停止", lambda: app.toggle_pause(), checked=lambda _: app.paused),
             Item("字幕を表示", lambda: app.toggle_visible(), checked=lambda _: s["visible"]),
             Item("クリック透過", lambda: app.toggle_click_through(), checked=lambda _: s["click_through"]),
             Item("原文を表示", lambda: app.toggle_source(), checked=lambda _: s["show_source"]),
             Menu.SEPARATOR,
             Item("音声認識", Menu(asr_item("whisper"), asr_item("livecaptions"))),
+            Item("音声の取得元 (Whisper)", Menu(*devices, Menu.SEPARATOR, Item("一覧を読み直す", lambda: self.refresh()))),
             Item("プロファイル", Menu(*profiles, Menu.SEPARATOR,
                                      Item("一覧を読み直す", lambda: self.refresh()),
                                      Item("profiles フォルダを開く", lambda: app.open_folder("profiles")))),

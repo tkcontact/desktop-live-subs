@@ -1,7 +1,6 @@
-"""既定の出力デバイスの音声を WASAPI ループバックで取り、VAD で発話ごとに切り出す"""
+"""出力デバイスの音声を WASAPI ループバックで取り、VAD で発話ごとに切り出す"""
 
 import logging
-import queue
 import threading
 import time
 
@@ -12,115 +11,176 @@ SAMPLE_RATE = 16000
 log = logging.getLogger(__name__)
 
 
-def default_output_id() -> str | None:
-    """既定の出力デバイスの ID。切り替わりの検出に使う。"""
-    try:
-        import comtypes
-        from pycaw.pycaw import AudioUtilities
+ALL, DEFAULT = "all", "default"  # 取得元: すべての出力デバイス / 既定の出力デバイス / それ以外はデバイス名
 
-        try:
-            comtypes.CoInitialize()  # 呼び出し元のスレッドで COM を使えるように (2 回目以降は何もしない)
-        except OSError:
-            pass
-        dev = AudioUtilities.GetSpeakers()
-        # pycaw の版によって IMMDevice そのものか、それを包んだ AudioDevice が返る
-        return dev.GetId() if hasattr(dev, "GetId") else dev.id
+
+def _com_init() -> None:
+    import comtypes
+
+    try:
+        comtypes.CoInitialize()  # 呼び出し元のスレッドで COM を使えるように (2 回目以降は何もしない)
+    except OSError:
+        pass
+
+
+def output_devices() -> list[tuple[str, str]]:
+    """使える出力デバイスの (ID, 名前)"""
+    from pycaw.pycaw import AudioUtilities
+
+    _com_init()
+    coll = AudioUtilities.GetDeviceEnumerator().EnumAudioEndpoints(0, 1)  # eRender, DEVICE_STATE_ACTIVE
+    out = []
+    for i in range(coll.GetCount()):
+        dev = AudioUtilities.CreateDevice(coll.Item(i))
+        out.append((dev.id, dev.FriendlyName))
+    return out
+
+
+def _device_signature(target: str):
+    """取得元の構成。変わったら開き直す (既定のデバイスの切り替え、USB の抜き差しなど)"""
+    try:
+        if target == DEFAULT:
+            from pycaw.pycaw import AudioUtilities
+
+            _com_init()
+            dev = AudioUtilities.GetSpeakers()
+            # pycaw の版によって IMMDevice そのものか、それを包んだ AudioDevice が返る
+            return dev.GetId() if hasattr(dev, "GetId") else dev.id
+        return tuple(sorted(output_devices()))
     except Exception:
-        log.debug("既定の出力デバイスを取得できませんでした", exc_info=True)
+        log.debug("出力デバイスの一覧を取得できませんでした", exc_info=True)
         return None
 
 
-class LoopbackAudio:
-    """既定の出力デバイスに流れている音を 16kHz mono の float32 で読む。
+class _Stream:
+    """1 つの出力デバイスのループバック。届いた音を 16kHz mono にして溜める。"""
 
+    def __init__(self, pa, dev: dict, block_sec: float):
+        import pyaudiowpatch as pyaudio
+        import soxr
+
+        self.name = dev["name"].removesuffix(" [Loopback]")
+        rate, channels = int(dev["defaultSampleRate"]), dev["maxInputChannels"]
+        resampler = soxr.ResampleStream(rate, SAMPLE_RATE, 1, dtype="float32")
+        self.lock = threading.Lock()
+        self.pending: list[np.ndarray] = []
+
+        def callback(data, frames, time_info, status):
+            x = np.frombuffer(data, np.float32).reshape(-1, channels).mean(axis=1)
+            y = resampler.resample_chunk(x)
+            with self.lock:
+                self.pending.append(y)
+            return (None, pyaudio.paContinue)
+
+        self.stream = pa.open(
+            format=pyaudio.paFloat32,
+            channels=channels,
+            rate=rate,
+            input=True,
+            input_device_index=dev["index"],
+            frames_per_buffer=int(rate * block_sec),
+            stream_callback=callback,
+        )
+        log.info("ループバック録音を開始: %s (%d Hz, %d ch)", self.name, rate, channels)
+
+    def take(self) -> np.ndarray | None:
+        with self.lock:
+            data, self.pending = self.pending, []
+        return np.concatenate(data) if data else None
+
+    def close(self) -> None:
+        try:
+            self.stream.stop_stream()
+            self.stream.close()
+        except Exception:
+            pass
+
+
+class LoopbackAudio:
+    """出力デバイスに流れている音を WASAPI ループバックで取り、16kHz mono の float32 で読む。
+
+    target が "all" ならすべての出力デバイスの音を足し合わせる (アプリごとに出力先を変えていても拾える)。
+    "default" なら既定の出力デバイスだけ、それ以外はその名前のデバイスだけ。
     WASAPI のループバックは何も再生されていない間はデータが来ないので、その間は無音で埋める
     (埋めないと、動画を止めた直後の発話が無音判定されずに切り出されないまま残る)。
-    既定のデバイスが変わったら開き直す。
+    デバイスの構成が変わったら開き直す。
     """
 
-    def __init__(self, block_sec: float = 0.1):
+    def __init__(self, target: str = ALL, block_sec: float = 0.1):
+        self.target = target
         self.block_sec = block_sec
-        self._q: queue.Queue[np.ndarray] = queue.Queue()
         self._pa = None
-        self._stream = None
-        self._resampler = None
-        self._device_id = None
+        self._streams: list[_Stream] = []
+        self._signature = None
         self._last_check = 0.0
         self._last_data = 0.0
         self.device_name = ""
 
     def start(self) -> None:
         import pyaudiowpatch as pyaudio
-        import soxr
 
+        self._signature = _device_signature(self.target)
         self._pa = pa = pyaudio.PyAudio()
-        wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
-        out = pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
-        dev = out if out.get("isLoopbackDevice") else None
-        if dev is None:
-            for lb in pa.get_loopback_device_info_generator():
-                if out["name"] in lb["name"]:
-                    dev = lb
-                    break
-        if dev is None:
-            raise RuntimeError(f"出力デバイス「{out['name']}」のループバックが見つかりません")
-
-        rate, channels = int(dev["defaultSampleRate"]), dev["maxInputChannels"]
-        self._resampler = soxr.ResampleStream(rate, SAMPLE_RATE, 1, dtype="float32")
-        self._channels = channels
-
-        def callback(data, frames, time_info, status):
-            x = np.frombuffer(data, np.float32).reshape(-1, channels).mean(axis=1)
-            self._q.put(x)
-            return (None, pyaudio.paContinue)
-
-        self._stream = pa.open(
-            format=pyaudio.paFloat32,
-            channels=channels,
-            rate=rate,
-            input=True,
-            input_device_index=dev["index"],
-            frames_per_buffer=int(rate * self.block_sec),
-            stream_callback=callback,
-        )
-        self._device_id = default_output_id()
+        loopbacks = list(pa.get_loopback_device_info_generator())
+        if self.target == ALL:
+            devs = loopbacks
+        else:
+            if self.target == DEFAULT:
+                wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+                name = pa.get_device_info_by_index(wasapi["defaultOutputDevice"])["name"]
+            else:
+                name = self.target
+            # 同じ名前のデバイスが複数ある (同じ型のモニターが 2 台など) ときはまとめて録る
+            devs = [d for d in loopbacks if d["name"].removesuffix(" [Loopback]") == name]
+        if not devs:
+            raise RuntimeError(f"出力デバイス「{self.target}」のループバックが見つかりません")
+        self._streams = []
+        for d in devs:
+            try:
+                self._streams.append(_Stream(pa, d, self.block_sec))
+            except Exception as e:
+                log.warning("%s のループバックを開けませんでした: %s", d["name"], e)
+        if not self._streams:
+            raise RuntimeError("ループバック録音を開始できるデバイスがありません")
+        self.device_name = " + ".join(s.name for s in self._streams)
         self._last_check = self._last_data = time.perf_counter()
-        self.device_name = out["name"]
-        log.info("ループバック録音を開始: %s (%d Hz, %d ch)", out["name"], rate, channels)
 
     def stop(self) -> None:
-        if self._stream is not None:
-            try:
-                self._stream.stop_stream()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
+        for s in self._streams:
+            s.close()
+        self._streams = []
         if self._pa is not None:
             self._pa.terminate()
             self._pa = None
-        self._q = queue.Queue()
 
     def read(self) -> np.ndarray:
-        """block_sec 程度の音声を返す。再生が止まっている間は経過時間ぶんの無音を返す。"""
+        """block_sec 程度の音声を返す。どのデバイスも再生していない間は経過時間ぶんの無音を返す。"""
+        time.sleep(self.block_sec)
         now = time.perf_counter()
-        if now - self._last_check > 2.0:
+        if now - self._last_check > 3.0:
             self._last_check = now
-            dev_id = default_output_id()
-            if dev_id and self._device_id and dev_id != self._device_id:
-                log.info("既定の出力デバイスが変わったので開き直します")
+            sig = _device_signature(self.target)
+            if sig is not None and sig != self._signature:
+                log.info("出力デバイスの構成が変わったので開き直します")
                 self.stop()
                 self.start()
-        try:
-            x = self._q.get(timeout=self.block_sec * 3)
-        except queue.Empty:
-            gap = time.perf_counter() - self._last_data
-            self._last_data = time.perf_counter()
+                return np.zeros(0, np.float32)
+
+        chunks = [c for c in (s.take() for s in self._streams) if c is not None]
+        if not chunks:
+            gap = now - self._last_data
+            if gap < self.block_sec * 2:
+                return np.zeros(0, np.float32)
+            self._last_data = now
             return np.zeros(int(SAMPLE_RATE * gap), np.float32)
-        self._last_data = time.perf_counter()
-        while not self._q.empty():
-            x = np.concatenate([x, self._q.get_nowait()])
-        return self._resampler.resample_chunk(x)
+        self._last_data = now
+        if len(chunks) == 1:
+            return chunks[0]
+        # 複数のデバイスで同時に鳴っているときは足し合わせる (ふつうは 1 つしか鳴っていない)
+        out = np.zeros(max(len(c) for c in chunks), np.float32)
+        for c in chunks:
+            out[: len(c)] += c
+        return np.clip(out, -1.0, 1.0)
 
 
 class FileAudio:
@@ -200,10 +260,10 @@ class Segmenter:
 class Capture:
     """LoopbackAudio (または FileAudio) を別スレッドで読み続け、切り出した発話を on_chunk に渡す。"""
 
-    def __init__(self, on_chunk, audio=None, min_silence_ms: int = 500, max_speech_s: float = 8.0):
+    def __init__(self, on_chunk, audio, min_silence_ms: int = 500, max_speech_s: float = 8.0):
         self.on_chunk = on_chunk
         self.segmenter = Segmenter(min_silence_ms, max_speech_s)
-        self.audio = audio or LoopbackAudio()
+        self.audio = audio
         self.paused = threading.Event()
         self._stop = threading.Event()
         self._thread = None
@@ -239,6 +299,8 @@ class Capture:
                 continue
             if self.paused.is_set():
                 self.segmenter.reset()
+                continue
+            if not len(samples):
                 continue
             for chunk, ended_at in self.segmenter.feed(samples, time.perf_counter()):
                 self.on_chunk(chunk, ended_at)
