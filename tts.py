@@ -63,8 +63,9 @@ def split_pieces(text: str) -> list[str]:
     return out
 
 
-def median_f0(audio: np.ndarray, rate: int) -> float | None:
-    """声の高さ (Hz) の中央値。声がはっきりしない (短い・小さい) ときは None"""
+def voice_f0(audio: np.ndarray, rate: int) -> float | None:
+    """声の高さ (Hz)。盛り上がって上ずった部分や倍の高さに誤検出した部分に引っぱられないよう、中央値ではなく
+    下から 30% の値を取る。声がはっきりしない (短い・小さい) ときは None"""
     if len(audio) < rate * 0.5:
         return None
     import librosa
@@ -74,25 +75,33 @@ def median_f0(audio: np.ndarray, rate: int) -> float | None:
     n = min(len(f0), len(rms))
     f0, rms = f0[:n], rms[:n]
     voiced = f0[(rms > rms.max() * 0.25) & (f0 > 70) & (f0 < 380)]  # 大きめの音の部分だけ (無声音や BGM を避ける)
-    return float(np.median(voiced)) if len(voiced) >= 10 else None
+    return float(np.percentile(voiced, 30)) if len(voiced) >= 10 else None
 
 
 class _NativePicker:
-    """英語の発話の声の高さで、ネイティブの声の男女を選ぶ。同じ人で行ったり来たりしないよう、切り替えに幅を持たせる"""
+    """英語の発話の声の高さで、ネイティブの声の男女を選ぶ。
+
+    同じ人で行ったり来たりしないよう、直近の発話の声の高さをならした値で決め、切り替えにも幅を持たせる
+    (TED の男性の講演で、1 発話ごとに決めると盛り上がったところで女性の声になった)。
+    """
 
     def __init__(self):
         self.current: str | None = None
+        self.level: float | None = None  # 声の高さ (log2 Hz) をならしたもの
 
     def pick(self, audio: np.ndarray, rate: int) -> tuple[str, float | None]:
-        f0 = median_f0(audio, rate)
+        f0 = voice_f0(audio, rate)
         if f0 is not None:
+            x = float(np.log2(f0))
+            self.level = x if self.level is None else self.level * 0.65 + x * 0.35
+            hz = 2**self.level
             if self.current is None:
-                self.current = "male" if f0 < 165 else "female"
-            elif self.current == "male" and f0 > 180:
+                self.current = "male" if hz < 155 else "female"
+            elif self.current == "male" and hz > 175:
                 self.current = "female"
-            elif self.current == "female" and f0 < 150:
+            elif self.current == "female" and hz < 140:
                 self.current = "male"
-        return self.current or "male", f0
+        return self.current or "male", (2**self.level if self.level is not None else None)
 
 
 def _max_tokens(text: str) -> int:
