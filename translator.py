@@ -17,16 +17,18 @@ log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
 You translate English audio playing on the user's PC (videos, games, voice chat) into Japanese subtitles.
-Each user message is the next piece of speech, transcribed by speech recognition. \
-It may contain recognition errors or be cut off mid-sentence; infer what was most likely said.
-Reply with only the Japanese translation of the latest message: natural, casual spoken Japanese \
+The text comes from speech recognition, so it may contain recognition errors or be cut off mid-sentence; \
+infer what was most likely said.
+Each request shows the previous lines with their Japanese subtitles as context, then the new line.
+Reply with only the Japanese translation of the new line: natural, casual spoken Japanese \
 that follows the flow of the conversation and matches the speaker's tone, short enough to read as a subtitle.
-Earlier messages are context only; never repeat or re-translate them.
-If the message stops mid-sentence, translate only what is there and end it with "…".
+Never repeat or re-translate the previous lines.
+If the new line stops mid-sentence, translate only what is there and end it with "…".
 Never leave English in the output except for names. No notes, quotes, romaji, or explanations."""
 
 # 一度に訳す長さの上限 (溜まった文をまとめて訳すとき)
 MAX_BATCH_CHARS = 600
+_JAPANESE = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff]")
 
 
 @dataclass
@@ -76,7 +78,7 @@ class Translator:
         self.client = OpenAI(base_url=self.base_url, api_key="strata", timeout=timeout, max_retries=0)
         self.model: str | None = None
         self.system_prompt = build_system_prompt(None)
-        # 直前の (原文, 訳文) を会話履歴として渡し、話の流れと訳語の一貫性を保つ
+        # 直前の (原文, 訳文) を文脈として渡し、話の流れと訳語の一貫性を保つ
         self.history: deque[tuple[str, str]] = deque(maxlen=context)
 
     def set_profile(self, profile: Profile | None) -> None:
@@ -102,11 +104,27 @@ class Translator:
         if self.model is None and not self.healthy():
             raise StrataUnavailable("Strata に接続できません")
 
-        messages = [{"role": "system", "content": self.system_prompt}]
-        for src, ja in self.history:
-            messages += [{"role": "user", "content": src}, {"role": "assistant", "content": ja}]
-        messages.append({"role": "user", "content": text})
+        out, ttft = self._complete(self._user_message(text, self.history), on_partial)
+        if not _JAPANESE.search(out) and self.history:
+            # 文脈に引きずられて空や英語のままを返すことがあるので、文脈なしで訳し直す
+            log.info("訳が空か英語のままだったので文脈なしで訳し直します: %s → %s", text, out)
+            retry, _ = self._complete(self._user_message(text, ()), on_partial)
+            out = retry if _JAPANESE.search(retry) else out
+        if _JAPANESE.search(out):
+            self.history.append((text, out))
+        return out, ttft
 
+    @staticmethod
+    def _user_message(text: str, history) -> str:
+        # 文脈は user と assistant の往復ではなく 1 つのメッセージにまとめて渡す。往復の形だと、
+        # Qwen3.8-Flash-Next Gyro-S は直前の短い訳につられて訳を途中で打ち切り、それがまた次に連鎖した
+        if not history:
+            return text
+        lines = "\n".join(f"EN: {src}\nJA: {ja}" for src, ja in history)
+        return f"Previous lines (context only):\n{lines}\n\nNew line:\n{text}"
+
+    def _complete(self, user_message: str, on_partial: Callable[[str], None] | None) -> tuple[str, float]:
+        messages = [{"role": "system", "content": self.system_prompt}, {"role": "user", "content": user_message}]
         t0 = time.perf_counter()
         ttft = 0.0
         out = ""
@@ -118,6 +136,9 @@ class Translator:
                 max_tokens=256,
                 reasoning_effort="none",  # 思考モードを切る (既定は high で、訳が出るまで数秒かかる)
                 stream=True,
+                # システムプロンプトの終わりを固定のチェックポイントにして、毎回読み直さないようにする。
+                # 短いプロンプトでは Strata がそこにチェックポイントを作らず、毎回 1 秒ほど読み直していた
+                extra_body={"strata_prefix": {"messages": 1}},
             )
             for chunk in stream:
                 delta = chunk.choices[0].delta.content if chunk.choices else None
@@ -134,6 +155,4 @@ class Translator:
             if e.status_code in (429, 502, 503, 504):  # 起動中・満杯
                 raise StrataUnavailable(f"HTTP {e.status_code}") from e
             raise
-        out = out.strip()
-        self.history.append((text, out))
-        return out, ttft
+        return out.strip(), ttft
